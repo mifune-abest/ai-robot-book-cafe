@@ -1,0 +1,12 @@
+{
+  "eventName": "AI ROBOT BOOK CAFE",
+  "freeModeEnabled": true,
+  "genres": ["いえ", "へや", "カフェ", "たべもの"],
+  "craftStyles": ["かっこいい", "かわいい", "おもしろい", "おまかせ"],
+  "tables": [
+    { "id": "table-1", "name": "1ばんテーブル", "expected": 4 },
+    { "id": "table-2", "name": "2ばんテーブル", "expected": 4 },
+    { "id": "table-3", "name": "3ばんテーブル", "expected": 4 },
+    { "id": "table-4", "name": "4ばんテーブル", "expected": 4 }
+  ]
+}

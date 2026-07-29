@@ -1,0 +1,28 @@
+{
+  "name": "ai-robot-book-cafe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "子ども食堂向け AI ROBOT BOOK CAFE ローカルWebアプリ",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/services/furigana-service.js && node --check public/app.js && node --check public/furigana.js && node --check public/file-guard.js && node --test test/*.test.js",
+    "test": "node --test test/*.test.js",
+    "visual:check": "node scripts/visual-check.mjs",
+    "ui:flow": "node scripts/ui-flow-check.mjs",
+    "start:test": "node scripts/start-test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "kuromoji": "^0.1.2",
+    "openai": "^6.49.0",
+    "sharp": "^0.35.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.0"
+  }
+}
