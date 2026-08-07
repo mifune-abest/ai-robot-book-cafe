@@ -38,6 +38,7 @@ const CAREER_IDEAS_SCHEMA = {
         properties: {
           kind: { type: 'string', enum: CAREER_IDEA_KINDS },
           job: { type: 'string', maxLength: 32 },
+          primaryInterestMatch: { type: 'boolean' },
           reasons: {
             type: 'array',
             items: { type: 'string', maxLength: 24 },
@@ -47,7 +48,7 @@ const CAREER_IDEAS_SCHEMA = {
           visualCategory: { type: 'string', enum: CAREER_VISUAL_CATEGORIES },
           visualMotif: { type: 'string', maxLength: 48 },
         },
-        required: ['kind', 'job', 'reasons', 'visualCategory', 'visualMotif'],
+        required: ['kind', 'job', 'primaryInterestMatch', 'reasons', 'visualCategory', 'visualMotif'],
         additionalProperties: false,
       },
     },
@@ -135,7 +136,7 @@ function comparableDreamText(value) {
     .replace(/[\s　？?!！。、・・]/g, '');
 }
 
-export function validateCareerIdeas(value) {
+export function validateCareerIdeas(value, { requiredPrimaryJob = '' } = {}) {
   if (!Array.isArray(value?.careers) || value.careers.length !== 3) {
     throw new Error('仕事のアイデアが3つではありません');
   }
@@ -145,6 +146,9 @@ export function validateCareerIdeas(value) {
     if (idea?.kind !== expectedKind) throw new Error('実在する仕事として分類されていません');
     if (!CAREER_VISUAL_CATEGORIES.includes(idea?.visualCategory)) {
       throw new Error('画像用の安全分類が不正です');
+    }
+    if (typeof idea?.primaryInterestMatch !== 'boolean') {
+      throw new Error('最初の興味との一致確認がありません');
     }
     if (!Array.isArray(idea?.reasons) || idea.reasons.length !== 2) {
       throw new Error('理由が2つではありません');
@@ -158,6 +162,7 @@ export function validateCareerIdeas(value) {
     return {
       kind: expectedKind,
       job,
+      primaryInterestMatch: idea.primaryInterestMatch,
       reasons,
       visualCategory: idea.visualCategory,
       visualMotif,
@@ -166,6 +171,12 @@ export function validateCareerIdeas(value) {
 
   if (new Set(careers.map((career) => career.job)).size !== careers.length) {
     throw new Error('仕事名が重複しています');
+  }
+  if (!careers[0].primaryInterestMatch || !careers[1].primaryInterestMatch) {
+    throw new Error('最初の興味が上位2つの仕事へ反映されていません');
+  }
+  if (requiredPrimaryJob && careers[0].job !== requiredPrimaryJob) {
+    throw new Error(`本人が希望した「${requiredPrimaryJob}」が候補1にありません`);
   }
   return { careers };
 }
@@ -190,6 +201,40 @@ export function validateCareerQuestion(value, history = []) {
     throw new Error('前と同じ質問です');
   }
   return { text, options };
+}
+
+function hasIdolPrimaryInterest(history) {
+  return /アイドル/.test(String(history[0]?.answer || '').normalize('NFKC'));
+}
+
+function safeIdolQuestion(step) {
+  if (step <= 1) {
+    return {
+      text: 'アイドルで なにを してみたい？',
+      options: ['うたう', 'おどる', 'おしばい', 'おはなしする'],
+    };
+  }
+  if (step === 2) {
+    return {
+      text: 'どんな れんしゅうが たのしい？',
+      options: ['なかまと いっしょ', 'せんせいと', 'ひとりで じっくり', 'みんなで そうだん'],
+    };
+  }
+  return {
+    text: 'ステージで どうしたい？',
+    options: ['えがおにしたい', 'げんきを とどけたい', 'おどろかせたい', 'いっしょに たのしみたい'],
+  };
+}
+
+export function validateCareerQuestionForStep(value, history = [], step = 0) {
+  try {
+    return validateCareerQuestion(value, history);
+  } catch (error) {
+    if (hasIdolPrimaryInterest(history) && /性別・外見・個人情報/.test(String(error?.message || ''))) {
+      return validateCareerQuestion(safeIdolQuestion(step), history);
+    }
+    throw error;
+  }
 }
 
 export function validateDreamQuestion(value, history = []) {
@@ -228,14 +273,84 @@ export function validateDreamQuestion(value, history = []) {
   return { text, options };
 }
 
+function explicitlyRequestedCareer(answers) {
+  const primary = String(answers[0] || '').normalize('NFKC');
+  const answer = primary.includes(' A:') ? primary.slice(primary.lastIndexOf(' A:') + 3).trim() : primary.trim();
+  return /^(?:アイドル|アイドル(?:に|を)?(?:なりたい|なってみたい|やりたい|してみたい))$/.test(answer)
+    ? 'アイドル'
+    : '';
+}
+
 function testCareerIdeas(answers) {
   const text = answers.join(' ');
+  const primaryAnswer = String(answers[0] || '');
+  if (explicitlyRequestedCareer(answers) === 'アイドル') {
+    return {
+      careers: [
+        {
+          kind: 'existing',
+          job: 'アイドル',
+          primaryInterestMatch: true,
+          reasons: ['歌やダンスで人を笑顔にできる', 'ステージで思いを届けられる'],
+          visualCategory: 'creative',
+          visualMotif: 'マイクと明るいステージと音符の飾り',
+        },
+        {
+          kind: 'existing',
+          job: '歌手',
+          primaryInterestMatch: true,
+          reasons: ['歌うことを仕事にできる', '声で気持ちを伝えられる'],
+          visualCategory: 'creative',
+          visualMotif: 'マイクと音符と明るいコンサート会場',
+        },
+        {
+          kind: 'existing',
+          job: 'ダンサー',
+          primaryInterestMatch: true,
+          reasons: ['ダンスで人を楽しませられる', '仲間と舞台を作り上げられる'],
+          visualCategory: 'creative',
+          visualMotif: '安全な舞台と音符とダンスの動き',
+        },
+      ],
+    };
+  }
+  if (/(?:ゲーム|げーむ|game)/i.test(primaryAnswer)) {
+    return {
+      careers: [
+        {
+          kind: 'existing',
+          job: 'ゲームプログラマー',
+          primaryInterestMatch: true,
+          reasons: ['ゲームを動かす仕組みを作れる', '遊びを形にして届けられる'],
+          visualCategory: 'making',
+          visualMotif: 'ゲーム画面の設計図と入力装置の模型',
+        },
+        {
+          kind: 'existing',
+          job: 'ゲームプランナー',
+          primaryInterestMatch: true,
+          reasons: ['ゲームのルールを考えられる', '楽しい遊び方を組み立てられる'],
+          visualCategory: 'creative',
+          visualMotif: 'ルール案のカードとステージ構成図',
+        },
+        {
+          kind: 'existing',
+          job: '3DCGデザイナー',
+          primaryInterestMatch: true,
+          reasons: ['ゲームの世界を立体で作れる', '物語の場面を見せられる'],
+          visualCategory: 'creative',
+          visualMotif: '立体モデルと色見本と背景の設計画',
+        },
+      ],
+    };
+  }
   if (/(?:恐竜|動物|いきもの|生き物)/.test(text)) {
     return {
       careers: [
         {
           kind: 'existing',
           job: '古生物学者',
+          primaryInterestMatch: true,
           reasons: ['好きなことを深く調べられる', '発見をみんなに伝えられる'],
           visualCategory: 'science',
           visualMotif: '化石の模型と観察ノート',
@@ -243,6 +358,7 @@ function testCareerIdeas(answers) {
         {
           kind: 'existing',
           job: 'サイエンスイラストレーター',
+          primaryInterestMatch: true,
           reasons: ['研究と絵を一緒に楽しめる', '昔の世界を形にできる'],
           visualCategory: 'creative',
           visualMotif: '恐竜のスケッチと地層模型',
@@ -250,6 +366,7 @@ function testCareerIdeas(answers) {
         {
           kind: 'existing',
           job: '博物館学芸員',
+          primaryInterestMatch: true,
           reasons: ['本物の資料を調べられる', '展示で発見を伝えられる'],
           visualCategory: 'animals_nature',
           visualMotif: '展示模型と資料カード',
@@ -262,6 +379,7 @@ function testCareerIdeas(answers) {
       {
         kind: 'existing',
         job: 'プロダクトデザイナー',
+        primaryInterestMatch: true,
         reasons: ['アイデアを形にできる', '人をわくわくさせられる'],
         visualCategory: 'creative',
         visualMotif: '色見本と小さな展示模型',
@@ -269,6 +387,7 @@ function testCareerIdeas(answers) {
       {
         kind: 'existing',
         job: '絵本作家',
+        primaryInterestMatch: true,
         reasons: ['ものづくりと物語を楽しめる', '新しい世界を伝えられる'],
         visualCategory: 'creative',
         visualMotif: 'スケッチと開いた絵本',
@@ -276,6 +395,7 @@ function testCareerIdeas(answers) {
       {
         kind: 'existing',
         job: 'ロボットエンジニア',
+        primaryInterestMatch: false,
         reasons: ['アイデアを試して作れる', '人の役に立つ機械を作れる'],
         visualCategory: 'making',
         visualMotif: '友好的な小型ロボットと設計模型',
@@ -292,6 +412,10 @@ function testCareerQuestion(history, step) {
     };
   }
   const lastAnswer = String(history.at(-1)?.answer || '');
+  const primaryAnswer = String(history[0]?.answer || '');
+  if (/アイドル/.test(primaryAnswer)) {
+    return safeIdolQuestion(step);
+  }
   if (step === 1 && /つく/.test(lastAnswer)) {
     return {
       text: 'つくるなら どれが たのしい？',
@@ -326,6 +450,18 @@ function testCareerQuestion(history, step) {
     text: 'しごとで どんな 気持ちに なりたい？',
     options: ['だいはっけん', 'ひとを えがおにする', 'あたらしい ものをつくる', 'みんなの やくにたつ'],
   };
+}
+
+function careerAnswerContext(answers) {
+  const [primary = '', ...secondary] = answers;
+  const requestedCareer = explicitlyRequestedCareer(answers);
+  const secondaryLines = secondary.length
+    ? secondary.map((answer, index) => `${index + 2}. ${safePromptFragment(answer, 120)}`).join('\n')
+    : 'なし';
+  const exactRequest = requestedCareer
+    ? `\n\n本人が明示した安全な実在職業:\n${requestedCareer}\n候補1のjobは必ずこの職業名と完全一致させる。`
+    : '';
+  return `最優先の興味（1番目の回答。ほかの回答より強く反映する）:\n1. ${safePromptFragment(primary, 120)}\n\n補助する回答（最優先の興味を置き換えず、役割ややり方を具体化する）:\n${secondaryLines}${exactRequest}`;
 }
 
 function testDreamQuestion(genre, history, step) {
@@ -787,11 +923,14 @@ export class CodexAppServerService {
     let lastError;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
+        const correction = attempt > 0 && lastError
+          ? `\n前回のJSONは次の理由で不採用でした: ${safePromptFragment(lastError.message, 160)}\n同じ問題を繰り返さず、元の安全条件を全て満たす内容へ作り直してください。`
+          : '';
         const result = await runCodexAppServer({
           command: this.command,
           model: this.model,
           timeoutMs: this.timeoutMs,
-          system: `${system}\nKeep the response concise enough for ${maxTokens} tokens. Attempt: ${attempt + 1}.`,
+          system: `${system}${correction}\nKeep the response concise enough for ${maxTokens} tokens. Attempt: ${attempt + 1}.`,
           user,
           schema,
         });
@@ -806,11 +945,13 @@ export class CodexAppServerService {
   }
 
   async nextCareerQuestion({ history, step }) {
-    if (this.testMode) return validateCareerQuestion(testCareerQuestion(history, step), history);
+    if (this.testMode) return validateCareerQuestionForStep(testCareerQuestion(history, step), history, step);
 
     const system = `あなたは小学生の興味を広げる職業体験の聞き手です。これまでの答えに合わせ、次に聞く新しい質問を1つと、子どもが選べる異なる答えを4つ作ります。
 
-最初は広い興味を聞き、その後は直前の答えを一歩深めてください。過去と同じ質問、ほぼ同じ選択肢、職業名そのものを選ばせる質問は避けます。適性診断や能力判定ではなく、好きな活動、場所、やり方、嬉しい気持ちを聞きます。
+最初は広い興味を聞きます。1番目の回答をその子の中心となる興味として、その後の3問でも保ってください。2番目以降の回答は中心の興味を置き換える材料ではなく、好きな役割、やり方、場所、嬉しい気持ちを具体化する補助情報です。直前の答えだけに引っ張られて、1番目の回答と無関係な話題へ移らないでください。過去と同じ質問、ほぼ同じ選択肢、職業名そのものを選ばせる質問は避けます。適性診断や能力判定はしません。
+
+最初の回答がアイドルや舞台活動への希望なら、歌う、踊る、演じる、話す、仲間と練習する、観客を楽しませるなど、安全な仕事内容だけを深めてください。見た目、顔、体型、衣装、化粧、髪型、肌、人気度を質問や選択肢に入れてはいけません。
 
 性別、外見、顔、体格、成績、障害、病気、家庭環境、収入、本名、学校名、住所、連絡先は質問しません。性別や外見から性格・興味・能力・職業適性を推測しません。夜職、成人向けサービス、犯罪、賭博、酒・たばこ・薬物、武器、性的表現、差別、実在ブランドやキャラクターを含めません。
 
@@ -822,18 +963,24 @@ export class CodexAppServerService {
     return this.callJson(
       system,
       user,
-      (value) => validateCareerQuestion(value, history),
+      (value) => validateCareerQuestionForStep(value, history, step),
       CAREER_QUESTION_SCHEMA,
       { maxTokens: 450 },
     );
   }
 
   async recommendCareer(answers) {
-    if (this.testMode) return validateCareerIdeas(testCareerIdeas(answers));
+    const requiredPrimaryJob = explicitlyRequestedCareer(answers);
+    const validateIdeas = (value) => validateCareerIdeas(value, { requiredPrimaryJob });
+    if (this.testMode) return validateIdeas(testCareerIdeas(answers));
 
     const system = `あなたは小学生の可能性を広げるキャリア体験の案内役です。これまでの4回の対話から、子どもが選べる実在の職業を必ず3つ提案します。これは適性診断ではなく「楽しそうな仕事の候補」です。固定の職業一覧や許可リストは使わず、答えに合わせて幅広い職業から自由に選んでください。性別情報は与えられていません。性別や外見を推測せず、対話で本人が選んだ興味だけを使います。
 
-3案すべて、現在の社会で実際に仕事として存在し、一般の求人、職業紹介、教育機関、業界団体などで職業名として使われる名称にします。造語、複数職業を合成した新名称、未来の仕事、架空の役、作品内の役、単なる「〜する人」という説明文は禁止です。専門職を選んでも構いませんが、実在に確信が持てない場合は、より一般的な実在職業名へ戻します。3案は異なる職業分野から選び、同じ仕事の言い換えにしません。kindは3案すべてexistingです。
+回答は均等に平均しません。1番目の回答を「最優先の興味」とし、残り3つより強く反映してください。1番目が「ゲームがしたい」「動物が好き」「絵を描きたい」のように具体的な活動や分野を示す場合、候補1と候補2は、その活動や分野が日常の仕事内容へ直接含まれる職業にします。理由に言葉だけを足した無関係な職業は不可です。候補1は最も直接的な仕事、候補2は同じ興味に別の役割から関われる仕事、候補3は最優先の興味と後の回答を組み合わせた仕事にします。候補1と候補2のprimaryInterestMatchは必ずtrueにし、直接関係しない場合は職業自体を選び直してください。
+
+本人が「アイドルになりたい」と明示した場合、アイドルは安全な実在職業として扱い、候補1のjobを必ず「アイドル」にします。歌手、俳優などへ勝手に置き換えません。理由は歌、ダンス、演技、トーク、練習、観客を楽しませる仕事に結び付け、見た目、顔、体型、衣装、化粧、髪型、人気度を理由にしません。
+
+3案すべて、現在の社会で実際に仕事として存在し、一般の求人、職業紹介、教育機関、業界団体などで職業名として使われる名称にします。造語、複数職業を合成した新名称、未来の仕事、架空の役、作品内の役、単なる「〜する人」という説明文は禁止です。専門職を選んでも構いませんが、実在に確信が持てない場合は、より一般的な実在職業名へ戻します。候補1と候補2は同じ業界でも構いませんが、担当する役割が異なる職業にし、同じ仕事の言い換えにはしません。kindは3案すべてexistingです。
 
 一般に「夜職」と呼ばれる職業は提案しません。ホスト、ホステス、キャバクラ・ラウンジ・ガールズバー・コンカフェ・スナックの接客、黒服、バーテンダー、ナイトクラブ勤務、風俗・成人向けサービス、およびそれらの言い換えをすべて除外します。
 
@@ -843,12 +990,12 @@ visualCategoryは次から1つだけ選びます: ${CAREER_VISUAL_CATEGORIES.joi
 visualMotifは、その仕事を写真で伝えるための安全な道具・モチーフ・活動だけを48文字以内で書きます。服装、身体、実在人物、ブランド、文字、武器、火、危険な乗り物は書きません。
 
 次のJSONだけを返してください:
-{"careers":[{"kind":"existing","job":"実在する職業名","reasons":["理由1","理由2"],"visualCategory":"creative","visualMotif":"安全な道具や活動"},{"kind":"existing","job":"実在する別の職業名","reasons":["理由1","理由2"],"visualCategory":"making","visualMotif":"安全な道具や活動"},{"kind":"existing","job":"実在する別の職業名","reasons":["理由1","理由2"],"visualCategory":"science","visualMotif":"安全な道具や活動"}]}`;
-    const user = `子どもとの4回の対話:\n${answers.map((answer, index) => `${index + 1}. ${safePromptFragment(answer, 120)}`).join('\n')}`;
+{"careers":[{"kind":"existing","job":"実在する職業名","primaryInterestMatch":true,"reasons":["理由1","理由2"],"visualCategory":"creative","visualMotif":"安全な道具や活動"},{"kind":"existing","job":"実在する別の職業名","primaryInterestMatch":true,"reasons":["理由1","理由2"],"visualCategory":"making","visualMotif":"安全な道具や活動"},{"kind":"existing","job":"実在する別の職業名","primaryInterestMatch":false,"reasons":["理由1","理由2"],"visualCategory":"science","visualMotif":"安全な道具や活動"}]}`;
+    const user = `子どもとの4回の対話:\n${careerAnswerContext(answers)}`;
     const proposal = await this.callJson(
       system,
       user,
-      validateCareerIdeas,
+      validateIdeas,
       CAREER_IDEAS_SCHEMA,
       { maxTokens: 1_100 },
     );
@@ -859,12 +1006,16 @@ visualMotifは、その仕事を写真で伝えるための安全な道具・モ
 
 各jobは、現在の社会で独立した職業名として使われ、実際の求人、公的な職業紹介、資格、教育機関、業界団体のいずれかでその名称が通用すると確信できるものに限ります。造語、複数の職業を合成した新名称、活動の説明、未来・架空・作品内の役は不可です。少しでも確信がない候補は、その興味に近く、より一般的で明らかに実在する職業名へ置き換えます。
 
-ホスト、ホステス、キャバクラ、ラウンジ、ガールズバー、コンカフェ、スナック、黒服、バーテンダー、ナイトクラブ、風俗・成人向けサービスなど、一般に夜職と呼ばれる職業とその言い換えは全て除外します。3件は異なる分野にし、kindは全てexistingとします。理由と画像用情報は確認後の職業に合わせて、入力と同じJSON形式だけを返してください。`;
-    const verificationUser = `子どもとの4回の対話:\n${answers.map((answer, index) => `${index + 1}. ${safePromptFragment(answer, 120)}`).join('\n')}\n\n初回候補:\n${JSON.stringify(proposal)}`;
+1番目の回答が最優先の興味です。候補1と候補2について、その職業の日常業務が最優先の興味へ直接関係するかを厳しく確認してください。理由の文だけが関係していて仕事自体が無関係なら不合格です。不合格なら、同じ興味へ別の役割から直接関われる実在職業へ置き換え、primaryInterestMatchをtrueにしてください。候補3は後の回答も組み合わせて構いません。候補1と候補2が同じ業界になることより、本人の最初の希望が叶うことを優先します。
+
+本人が「アイドルになりたい」と明示した場合、候補1のjobは必ず「アイドル」のままにします。アイドルは安全な実在職業として扱い、歌手や別の一般職へ置き換えません。ただし、理由と画像用モチーフは歌、ダンス、演技、トーク、練習、観客を楽しませる安全な仕事内容に限定します。
+
+ホスト、ホステス、キャバクラ、ラウンジ、ガールズバー、コンカフェ、スナック、黒服、バーテンダー、ナイトクラブ、風俗・成人向けサービスなど、一般に夜職と呼ばれる職業とその言い換えは全て除外します。kindは全てexistingとします。理由と画像用情報は確認後の職業に合わせて、入力と同じJSON形式だけを返してください。`;
+    const verificationUser = `子どもとの4回の対話:\n${careerAnswerContext(answers)}\n\n初回候補:\n${JSON.stringify(proposal)}`;
     return this.callJson(
       verificationSystem,
       verificationUser,
-      validateCareerIdeas,
+      validateIdeas,
       CAREER_IDEAS_SCHEMA,
       { maxTokens: 1_100 },
     );

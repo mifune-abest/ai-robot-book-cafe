@@ -89,14 +89,58 @@ test('② 素材写真を1枚の参照シートにまとめてCodexへ渡す', a
     materials: [
       { name: 'デニム', buffer: png, mime: 'image/png' },
       { name: 'ボタン', buffer: png, mime: 'image/png' },
+      { name: '素材3', buffer: png, mime: 'image/png' },
+      { name: '素材4', buffer: png, mime: 'image/png' },
+      { name: '素材5', buffer: png, mime: 'image/png' },
+      { name: '素材6', buffer: png, mime: 'image/png' },
+      { name: '素材7', buffer: png, mime: 'image/png' },
+      { name: '素材8', buffer: png, mime: 'image/png' },
+      { name: '素材9', buffer: png, mime: 'image/png' },
     ],
   });
 
   assert.equal(codex.calls.length, 1);
   assert.match(codex.calls[0].prompt, /Use only materials visibly present/);
   assert.match(codex.calls[0].prompt, /1:デニム, 2:ボタン/);
+  assert.match(codex.calls[0].prompt, /8:素材8/);
+  assert.doesNotMatch(codex.calls[0].prompt, /素材9/);
+  assert.match(codex.calls[0].prompt, /Use no more than eight physical material pieces in total/);
+  assert.match(codex.calls[0].prompt, /Do not exceed eight items/);
+  assert.match(codex.calls[0].prompt, /Advanced construction mode/);
+  assert.match(codex.calls[0].prompt, /cutting, folding, tying, sewing, or gluing/);
+  assert.match(codex.calls[0].prompt, /Arrange the chosen materials evenly and coherently/);
+  assert.match(codex.calls[0].prompt, /longer dimension occupy about 82 to 88 percent/);
+  assert.match(codex.calls[0].prompt, /margin of about 6 to 8 percent/);
+  assert.match(codex.calls[0].prompt, /Do not leave large unused blank areas/);
+  assert.match(codex.calls[0].prompt, /No cropped object, no close-up, and no partial view/);
   assert.equal(codex.calls[0].references.length, 1);
   assert.equal(codex.calls[0].references[0].mime, 'image/png');
+});
+
+test('② かんたんモードはデニムを1種類だけ使い、形を変えず全体を写す', async () => {
+  const codex = fakeCodex();
+  const service = new ImageService(imageConfig({ adultTestMode: true }), codex);
+
+  await service.craft({
+    mode: 'easy',
+    style: 'かわいい',
+    idea: '動物のかざり',
+    materials: [
+      { name: 'デニム細長布', buffer: png, mime: 'image/png' },
+      { name: 'デニム角布', buffer: png, mime: 'image/png' },
+      { name: 'デニム丸布', buffer: png, mime: 'image/png' },
+    ],
+  });
+
+  assert.equal(codex.calls.length, 1);
+  assert.match(codex.calls[0].prompt, /Easy construction mode/);
+  assert.match(codex.calls[0].prompt, /Choose exactly one denim fabric cutout type/);
+  assert.match(codex.calls[0].prompt, /use only that single denim cutout once/);
+  assert.match(codex.calls[0].prompt, /Do not use any other denim piece or denim type/);
+  assert.match(codex.calls[0].prompt, /preserve its original outer silhouette, aspect ratio, relative size/);
+  assert.match(codex.calls[0].prompt, /Do not cut, trim, tear, fold, roll, bend, twist, knot, stretch, shrink/);
+  assert.match(codex.calls[0].prompt, /Keep the entire object, every extremity, and every decoration fully inside/);
+  assert.doesNotMatch(codex.calls[0].prompt, /Advanced construction mode/);
 });
 
 test('③ 5回答から整理した指示をCodexへ渡す', async () => {

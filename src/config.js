@@ -26,6 +26,8 @@ export const config = Object.freeze({
   testMode: process.env.APP_TEST_MODE === '1',
   requestTimeoutMs: numberFromEnv('AI_TIMEOUT_MS', 180_000),
   imageTimeoutMs: numberFromEnv('IMAGE_TIMEOUT_MS', 300_000),
+  imageConcurrency: Math.max(1, Math.min(4, numberFromEnv('IMAGE_CONCURRENCY', 2))),
+  textConcurrency: Math.max(1, Math.min(4, numberFromEnv('TEXT_CONCURRENCY', 2))),
   tlsCertPath: process.env.TLS_CERT_PATH ? path.resolve(process.env.TLS_CERT_PATH) : '',
   tlsKeyPath: process.env.TLS_KEY_PATH ? path.resolve(process.env.TLS_KEY_PATH) : '',
 });

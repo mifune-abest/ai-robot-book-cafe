@@ -10,7 +10,7 @@ import { AppError, errorPayload } from './lib/errors.js';
 import { assertChildSafe } from './lib/safety.js';
 import { TaskQueue } from './lib/task-queue.js';
 import { cleanOptionalText, cleanText, integer, oneOf, parseDataUrl, randomId } from './lib/validation.js';
-import { ImageService } from './services/image-service.js';
+import { CRAFT_MATERIAL_LIMIT, ImageService } from './services/image-service.js';
 import { CodexAppServerService } from './services/codex-app-server.js';
 import { FuriganaService } from './services/furigana-service.js';
 import { createMemoryPoster } from './services/memory-poster.js';
@@ -23,14 +23,14 @@ const store = new JsonStore(config.dataDir);
 const textAi = new CodexAppServerService(config);
 const images = new ImageService(config, textAi);
 const furigana = new FuriganaService();
-const imageQueue = new TaskQueue({ concurrency: 1, maxPending: 20 });
-const textQueue = new TaskQueue({ concurrency: 1, maxPending: 40 });
+const imageQueue = new TaskQueue({ concurrency: config.imageConcurrency, maxPending: 20 });
+const textQueue = new TaskQueue({ concurrency: config.textConcurrency, maxPending: 40 });
 
 const careerSessions = new Map();
 const careerInterviewSessions = new Map();
 const dreamSessions = new Map();
 const CAREER_ADAPTIVE_QUESTION_COUNT = 4;
-const CAREER_TOTAL_STEPS = CAREER_ADAPTIVE_QUESTION_COUNT + 1;
+const CAREER_TOTAL_STEPS = CAREER_ADAPTIVE_QUESTION_COUNT;
 const DREAM_QUESTION_COUNT = 5;
 
 function sessionCleanup() {
@@ -235,7 +235,7 @@ function createPublicApp() {
       questionId,
       question: question.text,
       options: question.options,
-      step: 2,
+      step: 1,
       total: CAREER_TOTAL_STEPS,
     });
   }));
@@ -289,7 +289,7 @@ function createPublicApp() {
         questionId: nextQuestionId,
         question: question.text,
         options: question.options,
-        step: nextHistory.length + 2,
+        step: nextHistory.length + 1,
         total: CAREER_TOTAL_STEPS,
       };
       session.history = nextHistory;
@@ -374,16 +374,18 @@ function createPublicApp() {
 
   app.post('/api/craft/generate', asyncRoute(async (req, res) => {
     const state = store.read();
+    const requestedMode = cleanOptionalText(req.body?.mode, { field: 'つくりかた', max: 8 });
+    const mode = oneOf(requestedMode || 'hard', ['easy', 'hard'], 'つくりかた');
     const style = oneOf(cleanText(req.body?.style, { field: 'ふんいき', max: 20 }), state.settings.craftStyles, 'ふんいき');
     const idea = assertChildSafe(cleanOptionalText(req.body?.idea, { field: 'ことば', max: 40 }));
-    const active = state.materials.filter((item) => item.active);
+    const active = state.materials.filter((item) => item.active).slice(0, CRAFT_MATERIAL_LIMIT);
     if (!active.length) throw new AppError('MATERIALS_NOT_READY', 'そざいを じゅんび中です。スタッフを呼んでください。', 409);
     const materials = await Promise.all(active.map(async (item) => ({
       ...item,
       buffer: await fs.promises.readFile(findMaterialFile(item.url)),
       mime: item.mime || 'image/jpeg',
     })));
-    const buffer = await imageQueue.run(() => images.craft({ style, idea, materials }));
+    const buffer = await imageQueue.run(() => images.craft({ mode, style, idea, materials }));
     const resultUrl = await store.saveMedia(randomId('craft_'), buffer, 'png');
     res.json({ resultUrl, mock: images.status().mode === 'mock' });
   }));
@@ -833,6 +835,7 @@ async function start() {
     else console.log(`HTTPS証明書の対象外: ${address}`);
   }
   console.log(`ホスト専用: http://127.0.0.1:${config.hostPort}/host`);
+  console.log(`同時処理: 画像 ${config.imageConcurrency}件 / 会話AI ${config.textConcurrency}件`);
   console.log(`Codex app-server: ${health.ok ? `準備OK (${health.model})` : `利用不可 (${health.reason})`}`);
   if (protocol === 'http') console.log('注意: LANのHTTP接続ではブラウザのカメラを利用できません。HTTPS設定が必要です。');
 

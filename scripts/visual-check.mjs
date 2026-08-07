@@ -85,7 +85,7 @@ async function captureCareerRecommendations({ width, height }) {
     if (message.type() === 'error') errors.push(`${name}: console ${message.text()}`);
   });
   await page.goto(`${publicBase}/career`, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-  for (let index = 0; index < 5; index += 1) {
+  for (let index = 0; index < 4; index += 1) {
     const button = page.locator('[data-answer-index]').first();
     await button.waitFor({ state: 'visible', timeout: 10_000 });
     await button.click();

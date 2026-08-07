@@ -11,7 +11,12 @@ export class TaskQueue {
   }
 
   status() {
-    return { active: this.active, waiting: this.pending.length, accepting: this.accepting };
+    return {
+      active: this.active,
+      waiting: this.pending.length,
+      accepting: this.accepting,
+      concurrency: this.concurrency,
+    };
   }
 
   run(task) {

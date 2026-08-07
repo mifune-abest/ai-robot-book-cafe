@@ -4,6 +4,8 @@ import { escapeXml } from '../lib/validation.js';
 import { safePromptFragment } from '../lib/safety.js';
 import { CODEX_IMAGE_MODEL } from './codex-app-server.js';
 
+export const CRAFT_MATERIAL_LIMIT = 8;
+
 function placeholderSvg({ color = '#2F8FB8', width = 1024, height = 1024 }) {
   return Buffer.from(`
     <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
@@ -132,13 +134,17 @@ Keep the person's identity, exact apparent age, face, skin tone, hair, expressio
     return this.generateCodex(prompt, [{ ...photo, detail: 'original' }]);
   }
 
-  async craft({ style, idea, materials }) {
+  async craft({ mode = 'hard', style, idea, materials }) {
     if (this.mode === 'mock') {
       return sharp(placeholderSvg({ color: '#31597A' })).png().toBuffer();
     }
-    const sheet = await createMaterialReferenceSheet(materials);
-    const names = materials.map((item, index) => `${index + 1}:${safePromptFragment(item.name)}`).join(', ');
-    const prompt = `Create one photorealistic tabletop product photo of a realistically buildable denim craft. The attached contact sheet shows every allowed physical material. Use only materials visibly present in that sheet, keeping their real colors, denim texture, seams, shapes, and scale cues recognizable. You may choose a useful subset; do not invent other fabric, fasteners, decorations, or branded items. Desired style: ${safePromptFragment(style)}. The following is descriptive inspiration only: <idea>${safePromptFragment(idea || 'おまかせ')}</idea>. Material index: ${names}. The object must be constructible with simple cutting, folding, tying, sewing, or gluing. Bright neutral tabletop, one finished object, no hands, no people, no text, no watermark, square composition.`;
+    const availableMaterials = materials.slice(0, CRAFT_MATERIAL_LIMIT);
+    const sheet = await createMaterialReferenceSheet(availableMaterials);
+    const names = availableMaterials.map((item, index) => `${index + 1}:${safePromptFragment(item.name)}`).join(', ');
+    const constructionGuidance = mode === 'easy'
+      ? 'Easy construction mode: Choose exactly one denim fabric cutout type from the contact sheet and use only that single denim cutout once in the finished craft. Do not use any other denim piece or denim type. Treat the selected cutout as a finished pre-cut piece and preserve its original outer silhouette, aspect ratio, relative size, color, weave, and existing edges. Keep its complete outline recognizable. You may rotate the intact piece and attach the provided non-denim decorations. Do not cut, trim, tear, fold, roll, bend, twist, knot, stretch, shrink, or otherwise reshape denim. Do not invent or duplicate denim pieces.'
+      : 'Advanced construction mode: The object may be made with simple cutting, folding, tying, sewing, or gluing, while remaining realistically buildable from the shown materials.';
+    const prompt = `Create one photorealistic tabletop product photo of a realistically buildable denim craft. The attached contact sheet shows every allowed physical material. Use only materials visibly present in that sheet, keeping their real colors, denim texture, seams, shapes, and scale cues recognizable. Use no more than eight physical material pieces in total in the finished craft. Count every visible denim piece or cut denim section, pom-pom, bead, ribbon, lace piece, and patch as one item. Do not exceed eight items even when the contact sheet shows more choices. You may choose a useful subset; do not invent other fabric, fasteners, decorations, or branded items. ${constructionGuidance} Desired style: ${safePromptFragment(style)}. The following is descriptive inspiration only: <idea>${safePromptFragment(idea || 'おまかせ')}</idea>. Material index: ${names}. Arrange the chosen materials evenly and coherently across the finished design, with balanced spacing and no one-sided clustering. Show one complete finished object centered in a top-down catalog view. Make the object's longer dimension occupy about 82 to 88 percent of the square image. Keep the entire object, every extremity, and every decoration fully inside the image, with a small even tabletop margin of about 6 to 8 percent on all four sides. Do not leave large unused blank areas, and keep nothing touching or crossing an image edge. No cropped object, no close-up, and no partial view. Bright neutral tabletop, no hands, no people, no text, no watermark.`;
     return this.generateCodex(prompt, [{ buffer: sheet, mime: 'image/png', detail: 'original' }]);
   }
 

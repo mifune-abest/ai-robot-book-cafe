@@ -88,6 +88,8 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
     'mock',
     '外部送信・課金を避けるため、APIテストはIMAGE_PROVIDER=mockで実行してください。',
   );
+  assert.equal(health.queues?.image?.concurrency, 2);
+  assert.equal(health.queues?.text?.concurrency, 2);
 
   const initialHostState = await expectJson(hostBaseUrl, '/api/host/state');
   assert.equal(
@@ -191,7 +193,7 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
     ]);
   });
 
-  await t.test('① 性別を外部送信せず、AI適応質問4回から実在する3職業を自由提案する', async () => {
+  await t.test('① 性別選択なしで、AI適応質問4回から実在する3職業を自由提案する', async () => {
     const config = await expectJson(publicBaseUrl, '/api/public-config');
     assert.equal('careerQuestions' in config, false, '固定職業質問を公開してはいけません。');
 
@@ -202,8 +204,8 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
     assert.match(started.sessionId, /^career_interview_/);
     assert.match(started.questionId, /^career_question_/);
     assert.equal(started.options?.length, 4);
-    assert.equal(started.step, 2);
-    assert.equal(started.total, 5);
+    assert.equal(started.step, 1);
+    assert.equal(started.total, 4);
     assert.doesNotMatch(JSON.stringify(started), /性別|男の子|女の子/);
 
     await expectApiError(publicBaseUrl, '/api/career/start', {
@@ -224,14 +226,14 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
     const firstRequest = {
       sessionId: started.sessionId,
       questionId: started.questionId,
-      answer: started.options[0],
+      answer: 'ゲームがしたい',
     };
     let progress = await expectJson(publicBaseUrl, '/api/career/answer', {
       method: 'POST',
       body: firstRequest,
     });
     assert.equal(progress.ready, false);
-    assert.equal(progress.step, 3);
+    assert.equal(progress.step, 2);
     assert.equal(progress.options?.length, 4);
     const repeated = await expectJson(publicBaseUrl, '/api/career/answer', {
       method: 'POST',
@@ -264,7 +266,7 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
         },
       });
     }
-    assert.equal(progress.step, 5);
+    assert.equal(progress.step, 4);
 
     const recommendation = await expectJson(publicBaseUrl, '/api/career/recommend', {
       method: 'POST',
@@ -273,12 +275,15 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
     assert.equal(recommendation.careers?.length, 3);
     assert.deepEqual(recommendation.careers.map((career) => career.kind), ['existing', 'existing', 'existing']);
     assert.equal(new Set(recommendation.careers.map((career) => career.job)).size, 3);
+    assert.match(recommendation.careers[0].job, /ゲーム/);
+    assert.match(recommendation.careers[1].job, /ゲーム/);
     for (const career of recommendation.careers) {
       assert.match(career.careerId, /^career_/);
       assert.equal(typeof career.job, 'string');
       assert.equal(career.reasons?.length, 2);
       assert.equal('visualCategory' in career, false, '画像用の内部安全分類を公開してはいけません。');
       assert.equal('visualMotif' in career, false, '画像用の内部モチーフを公開してはいけません。');
+      assert.equal('primaryInterestMatch' in career, false, '内部の興味一致判定を公開してはいけません。');
     }
 
     const repeatedRecommendation = await expectJson(publicBaseUrl, '/api/career/recommend', {
@@ -303,17 +308,66 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
     await expectPng(publicBaseUrl, generated.resultUrl);
   });
 
-  await t.test('② 登録済み素材で工作完成イメージを生成する', async () => {
+  await t.test('① 「アイドルになりたい」は安全な質問だけで深め、候補1へそのまま表示する', async () => {
+    let progress = await expectJson(publicBaseUrl, '/api/career/start', {
+      method: 'POST',
+      body: {},
+    });
+    const sessionId = progress.sessionId;
+    for (let index = 0; index < 4; index += 1) {
+      progress = await expectJson(publicBaseUrl, '/api/career/answer', {
+        method: 'POST',
+        body: {
+          sessionId,
+          questionId: progress.questionId,
+          answer: index === 0 ? 'アイドルになりたい' : progress.options[0],
+        },
+      });
+      if (progress.ready === true) break;
+      assert.doesNotMatch(
+        JSON.stringify(progress),
+        /見た目|顔|体型|衣装|化粧|髪型|肌/,
+        'アイドル希望で外見に関する質問をしてはいけません。',
+      );
+    }
+    assert.equal(progress.ready, true);
+    const recommendation = await expectJson(publicBaseUrl, '/api/career/recommend', {
+      method: 'POST',
+      body: { sessionId },
+    });
+    assert.equal(recommendation.careers?.[0]?.job, 'アイドル');
+    assert.match(
+      recommendation.careers.slice(0, 2).flatMap((career) => career.reasons).join(' '),
+      /歌|ダンス|ステージ/,
+    );
+  });
+
+  await t.test('② かんたん・むずかしいの両方で工作完成イメージを生成する', async () => {
     const config = await expectJson(publicBaseUrl, '/api/public-config');
     assert.ok(config.materials?.length > 0, 'テスト用素材がありません。APP_TEST_MODE=1を確認してください。');
 
-    const generated = await expectJson(publicBaseUrl, '/api/craft/generate', {
+    const easy = await expectJson(publicBaseUrl, '/api/craft/generate', {
       method: 'POST',
-      body: { style: 'かわいい', idea: '星のついた小物入れ' },
+      body: { mode: 'easy', style: 'かわいい', idea: '星のついた小物入れ' },
     });
-    assert.equal(generated.mock, true);
-    assert.match(generated.resultUrl, /^\/media\/craft_[A-Za-z0-9_-]+\.png$/);
-    await expectPng(publicBaseUrl, generated.resultUrl);
+    assert.equal(easy.mock, true);
+    assert.match(easy.resultUrl, /^\/media\/craft_[A-Za-z0-9_-]+\.png$/);
+    await expectPng(publicBaseUrl, easy.resultUrl);
+
+    const hard = await expectJson(publicBaseUrl, '/api/craft/generate', {
+      method: 'POST',
+      body: { mode: 'hard', style: 'かっこいい', idea: '' },
+    });
+    assert.equal(hard.mock, true);
+    await expectPng(publicBaseUrl, hard.resultUrl);
+
+    await expectApiError(
+      publicBaseUrl,
+      '/api/craft/generate',
+      { method: 'POST', body: { mode: 'expert', style: 'かわいい', idea: '' } },
+      400,
+      'INVALID_CHOICE',
+    );
   });
 
   await t.test('③ 過去の回答に合わせたAI質問5回の完了後だけ理想の画像を生成する', async () => {

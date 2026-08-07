@@ -21,14 +21,7 @@ const CAREER_KIND_META = {
   existing: { label: "じっさいに ある しごと" },
 };
 
-const CAREER_GENDER_OPTIONS = [
-  { value: "girl", label: "おんなのこ", icon: "女" },
-  { value: "boy", label: "おとこのこ", icon: "男" },
-  { value: "neither", label: "どれにも あてはまらない", icon: "—" },
-  { value: "prefer_not_to_say", label: "こたえない", icon: "○" },
-];
-
-const CAREER_TOTAL_STEPS = 5;
+const CAREER_TOTAL_STEPS = 4;
 const CAREER_IMAGE_ESTIMATE_MS = 180_000;
 const DREAM_TOTAL_QUESTIONS = 5;
 
@@ -660,18 +653,7 @@ function initCareer() {
     resultImageUrl: "",
   };
   state.hasProgress = false;
-  renderCareerGender();
-}
-
-function renderCareerGender() {
-  renderQuestion({
-    current: 1,
-    total: CAREER_TOTAL_STEPS,
-    question: "せいべつを えらんでね",
-    options: CAREER_GENDER_OPTIONS,
-    allowCustom: false,
-    onAnswer: startCareerInterview,
-  });
+  startCareerInterview();
 }
 
 function normalizeCareerInterviewQuestion(response) {
@@ -692,7 +674,7 @@ function normalizeCareerInterviewQuestion(response) {
     id: questionId,
     text: text,
     options: choices,
-    step: Number(value.step) || 2,
+    step: Number(value.step) || 1,
     total: Number(value.total) || CAREER_TOTAL_STEPS,
   };
 }
@@ -701,7 +683,6 @@ async function startCareerInterview() {
   state.hasProgress = true;
   loadingScreen("しつもんを かんがえ中", "きみに あった しつもんを つくっているよ");
   try {
-    // 性別の選択値はブラウザにも保存せず、GPTやサーバーへ送らない。
     const response = await apiPost("/api/career/start", {});
     const value = unwrapData(response) || {};
     const sessionId = String(value.sessionId || value.sessionID || "").trim();
@@ -717,8 +698,6 @@ async function startCareerInterview() {
       message: formatChildError(error),
       retry: startCareerInterview,
       retryLabel: "もういちど はじめる",
-      back: renderCareerGender,
-      backLabel: "えらびなおす",
     });
   }
 }
@@ -727,7 +706,7 @@ function renderCareerQuestion() {
   const career = state.career;
   const question = career.question;
   if (!question) {
-    renderCareerGender();
+    startCareerInterview();
     return;
   }
 
@@ -1149,6 +1128,7 @@ function renderCareerResult() {
 
 function initCraft() {
   state.craft = {
+    mode: "",
     style: "",
     idea: "",
     resultImageUrl: "",
@@ -1199,6 +1179,37 @@ function renderCraftStart() {
     return;
   }
 
+  setView(
+    '<section class="screen"><div class="screen-heading">' +
+      renderMaterialsStrip(materials) +
+      '<h1 data-autofocus tabindex="-1">つくりかたを えらぶ</h1></div>' +
+      '<div class="choice-grid">' +
+      '<button class="choice-button" type="button" data-craft-mode="easy">' +
+      '<span class="choice-icon" aria-hidden="true">○</span>' +
+      '<span class="choice-copy"><span>かんたん</span>' +
+      '<span class="choice-note">デニムは ひとつだけ・かたちは そのまま</span></span></button>' +
+      '<button class="choice-button" type="button" data-craft-mode="hard">' +
+      '<span class="choice-icon" aria-hidden="true">★</span>' +
+      '<span class="choice-copy"><span>むずかしい</span>' +
+      '<span class="choice-note">デニムを きったり まげたり</span></span></button>' +
+      "</div></section>",
+  );
+
+  document.querySelectorAll("[data-craft-mode]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      state.craft.mode = button.dataset.craftMode;
+      renderCraftStyles();
+    });
+  });
+}
+
+function renderCraftStyles() {
+  const materials = craftMaterials();
+  if (!materials.length) {
+    renderCraftStart();
+    return;
+  }
+
   const styles = craftStyles().map(normalizeOption);
   let choices = "";
   styles.forEach(function (style, index) {
@@ -1220,10 +1231,13 @@ function renderCraftStart() {
   setView(
     '<section class="screen"><div class="screen-heading">' +
       renderMaterialsStrip(materials) +
+      '<p class="eyebrow">' +
+      (state.craft.mode === "easy" ? "かんたんな つくりかた" : "むずかしい つくりかた") +
+      "</p>" +
       '<h1 data-autofocus tabindex="-1">どんなのを つくる？</h1></div>' +
       '<div class="choice-grid">' +
       choices +
-      "</div></section>",
+      '</div><div class="actions"><button class="button button--secondary" id="craft-change-mode" type="button">つくりかたを かえる</button></div></section>',
   );
 
   document.querySelectorAll("[data-craft-style]").forEach(function (button) {
@@ -1236,6 +1250,7 @@ function renderCraftStart() {
     });
   });
   document.querySelector("#craft-custom").addEventListener("click", renderCraftCustom);
+  document.querySelector("#craft-change-mode").addEventListener("click", renderCraftStart);
 }
 
 function renderCraftCustom() {
@@ -1251,14 +1266,20 @@ function renderCraftCustom() {
       state.hasProgress = true;
       generateCraftImage();
     },
-    onBack: renderCraftStart,
+    onBack: renderCraftStyles,
   });
 }
 
 async function generateCraftImage() {
-  loadingScreen("みほんを つくっているよ", "デニムが どんなかたちに なるかな？");
+  loadingScreen(
+    "みほんを つくっているよ",
+    state.craft.mode === "easy"
+      ? "デニムは ひとつだけ・かたちは そのまま つかうよ"
+      : "デニムが どんなかたちに なるかな？",
+  );
   try {
     const response = await apiPost("/api/craft/generate", {
+      mode: state.craft.mode,
       style: state.craft.style,
       idea: state.craft.idea,
     });
@@ -1272,8 +1293,8 @@ async function generateCraftImage() {
       message: formatChildError(error),
       retry: generateCraftImage,
       retryLabel: "もういちど つくる",
-      back: state.craft.style === "おまかせ" ? renderCraftCustom : renderCraftStart,
-      backLabel: "ことばを えらびなおす",
+      back: state.craft.style === "おまかせ" ? renderCraftCustom : renderCraftStyles,
+      backLabel: state.craft.style === "おまかせ" ? "ことばを えらびなおす" : "みほんを えらびなおす",
     });
   }
 }

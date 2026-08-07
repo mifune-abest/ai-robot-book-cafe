@@ -4,6 +4,7 @@ import {
   CAREER_VISUAL_CATEGORIES,
   validateCareerIdeas,
   validateCareerQuestion,
+  validateCareerQuestionForStep,
 } from '../src/services/codex-app-server.js';
 
 function safeIdeas() {
@@ -12,6 +13,7 @@ function safeIdeas() {
       {
         kind: 'existing',
         job: '海洋生物研究者',
+        primaryInterestMatch: true,
         reasons: ['生き物を深く調べられる', '発見を人に伝えられる'],
         visualCategory: 'animals_nature',
         visualMotif: '観察ノートと海の生き物の模型',
@@ -19,6 +21,7 @@ function safeIdeas() {
       {
         kind: 'existing',
         job: 'サイエンスイラストレーター',
+        primaryInterestMatch: true,
         reasons: ['科学と絵を一緒に楽しめる', '物語で未来を伝えられる'],
         visualCategory: 'creative',
         visualMotif: '小型ロボットと海のスケッチ',
@@ -26,6 +29,7 @@ function safeIdeas() {
       {
         kind: 'existing',
         job: 'ロボットエンジニア',
+        primaryInterestMatch: false,
         reasons: ['新しい方法を考えられる', '生き物の調査に役立てられる'],
         visualCategory: 'making',
         visualMotif: '青い海の模型と小さな発明品',
@@ -114,6 +118,21 @@ test('実在分類・重複・内部安全分類を検証する', () => {
   const invalidCategory = safeIdeas();
   invalidCategory.careers[0].visualCategory = 'unknown';
   assert.throws(() => validateCareerIdeas(invalidCategory), /安全分類/);
+
+  const primaryInterestMissing = safeIdeas();
+  primaryInterestMissing.careers[1].primaryInterestMatch = false;
+  assert.throws(() => validateCareerIdeas(primaryInterestMissing), /最初の興味/);
+
+  assert.throws(
+    () => validateCareerIdeas(safeIdeas(), { requiredPrimaryJob: 'アイドル' }),
+    /本人が希望した「アイドル」/,
+  );
+  const exactIdol = safeIdeas();
+  exactIdol.careers[0].job = 'アイドル';
+  assert.equal(
+    validateCareerIdeas(exactIdol, { requiredPrimaryJob: 'アイドル' }).careers[0].job,
+    'アイドル',
+  );
 });
 
 test('AI生成の職業質問は4選択肢と過去の対話を検証する', () => {
@@ -145,4 +164,24 @@ test('AIの職業質問に性別・外見・個人情報を含めない', () => 
       text,
     );
   }
+});
+
+test('アイドル希望でAIが外見を質問した場合は安全な活動質問へ置き換える', () => {
+  const history = [{ question: 'どんな ことで わくわくする？', answer: 'アイドルになりたい' }];
+  const repaired = validateCareerQuestionForStep({
+    text: 'どんな 見た目に なりたい？',
+    options: ['かわいい 見た目', 'かっこいい 顔', '髪型を かえる', '歌を うたう'],
+  }, history, 1);
+
+  assert.equal(repaired.text, 'アイドルで なにを してみたい?');
+  assert.deepEqual(repaired.options, ['うたう', 'おどる', 'おしばい', 'おはなしする']);
+  assert.doesNotMatch(JSON.stringify(repaired), /見た目|顔|体型|衣装|化粧|髪型|肌/);
+
+  assert.throws(
+    () => validateCareerQuestionForStep({
+      text: 'どんな 見た目に なりたい？',
+      options: ['ひとつ', 'ふたつ', 'みっつ', 'よっつ'],
+    }, [{ question: 'どんな ことで わくわくする？', answer: 'ゲームがしたい' }], 1),
+    /性別・外見・個人情報/,
+  );
 });

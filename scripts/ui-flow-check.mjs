@@ -85,10 +85,10 @@ try {
     }
   });
   await career.goto(`${publicBase}/career`);
-  for (let index = 0; index < 5; index += 1) await clickFirstAnswer(career);
+  for (let index = 0; index < 4; index += 1) await clickFirstAnswer(career);
   await assertFurigana(career, 'career-recommendations');
   if (!careerStartPayload || 'gender' in careerStartPayload) {
-    throw new Error('性別の選択値をサーバーへ送っています。');
+    throw new Error('削除済みの性別入力をサーバーへ送っています。');
   }
   await career.locator('[data-career-index]').first().click();
   const file = career.locator('#career-photo-file');
@@ -122,9 +122,30 @@ try {
 
   const craft = await context.newPage();
   watch(craft, 'craft-flow');
+  let craftGeneratePayload;
+  craft.on('request', (request) => {
+    if (request.url().endsWith('/api/craft/generate') && request.method() === 'POST') {
+      craftGeneratePayload = request.postDataJSON();
+    }
+  });
   await craft.goto(`${publicBase}/craft`);
+  await craft.locator('[data-craft-mode="easy"]').click();
   await craft.locator('[data-craft-style]').first().click();
   await craft.locator('#craft-fullscreen').waitFor({ state: 'visible', timeout: 15_000 });
+  if (craftGeneratePayload?.mode !== 'easy') {
+    throw new Error('craft-flow: かんたんモードが画像生成APIへ送られていません。');
+  }
+  const craftImageFits = await craft.evaluate(() => {
+    const frame = document.querySelector('.result-image-frame')?.getBoundingClientRect();
+    const image = document.querySelector('.result-image')?.getBoundingClientRect();
+    if (!frame || !image) return false;
+    const tolerance = 1;
+    return image.left >= frame.left - tolerance
+      && image.top >= frame.top - tolerance
+      && image.right <= frame.right + tolerance
+      && image.bottom <= frame.bottom + tolerance;
+  });
+  if (!craftImageFits) throw new Error('craft-flow: 完成画像が表示枠からはみ出しています。');
   await assertFurigana(craft, 'craft-result');
   await craft.screenshot({ path: path.join(screenshotDir, 'flow-craft-result-1366x768.png'), fullPage: true });
 
