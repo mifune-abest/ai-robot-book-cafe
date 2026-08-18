@@ -59,10 +59,17 @@ ruby[data-furigana="true"] > rt::before {
   content: attr(data-reading);
 }
 
-body[data-route="career"] {
+body[data-route="career"],
+body[data-route="career-card"] {
   --accent: #1769aa;
   --accent-dark: #0e4d80;
   --accent-soft: #e5f2ff;
+}
+
+body[data-route="career-card"] {
+  --accent: #087e8b;
+  --accent-dark: #055f69;
+  --accent-soft: #dff5f4;
 }
 
 body[data-route="craft"] {
@@ -809,11 +816,13 @@ h3 {
 }
 
 @media (min-width: 861px) {
-  body[data-route="career"] .result-layout {
+  body[data-route="career"] .result-layout,
+  body[data-route="career-card"] .result-layout {
     grid-template-columns: minmax(0, 1.05fr) minmax(420px, 0.95fr);
   }
 
-  body[data-route="career"] .result-copy h1 {
+  body[data-route="career"] .result-copy h1,
+  body[data-route="career-card"] .result-copy h1 {
     font-size: clamp(30px, 3.2vw, 44px);
   }
 }
@@ -822,6 +831,20 @@ h3 {
 .result-copy .lead {
   margin-left: 0;
   text-align: left;
+}
+
+.local-photo-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 42px;
+  margin: 0 0 14px;
+  padding: 8px 14px;
+  color: var(--accent-dark);
+  font-size: 16px;
+  font-weight: 900;
+  background: var(--accent-soft);
+  border: 2px solid var(--accent);
+  border-radius: 10px;
 }
 
 .camera-copy .actions,
@@ -943,6 +966,11 @@ body[data-route="craft"] .screen-heading {
   margin: 28px auto 0;
 }
 
+.home-title span {
+  display: inline-block;
+  white-space: nowrap;
+}
+
 .route-card {
   min-height: 110px;
   font-size: 22px;
@@ -952,6 +980,10 @@ body[data-route="craft"] .screen-heading {
   grid-column: 1 / -1;
   min-height: 72px;
   font-size: 18px;
+}
+
+.route-card--wide {
+  grid-column: 1 / -1;
 }
 
 .route-card__number {
@@ -1594,25 +1626,33 @@ body[data-route="craft"] .screen-heading {
     font-size: 26px;
   }
 
-  body[data-route="career"] .screen-heading {
+  body[data-route="career"] .screen-heading,
+  body[data-route="career-card"] .screen-heading {
     margin-bottom: 12px;
   }
 
-  body[data-route="career"] .choice-grid {
+  body[data-route="career"] .choice-grid,
+  body[data-route="career-card"] .choice-grid {
     gap: 9px;
   }
 
-  body[data-route="career"] .choice-button {
+  body[data-route="career"] .choice-button,
+  body[data-route="career-card"] .choice-button {
     min-height: 72px;
     padding: 10px 14px;
   }
 
-  body[data-route="career"] .choice-icon {
+  body[data-route="career"] .choice-icon,
+  body[data-route="career-card"] .choice-icon {
     width: 46px;
     height: 46px;
   }
 
   .route-card--host {
+    grid-column: auto;
+  }
+
+  .route-card--wide {
     grid-column: auto;
   }
 

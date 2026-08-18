@@ -17,6 +17,7 @@
     "node": ">=22"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "1.0.1",
     "express": "^5.2.1",
     "kuromoji": "^0.1.2",
     "openai": "^6.49.0",

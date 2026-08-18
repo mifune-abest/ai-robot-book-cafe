@@ -74,7 +74,7 @@ async function expectPng(baseUrl, pathname) {
   );
 }
 
-test('4アプリとホスト分離の主要APIを一連の流れで確認する', { timeout: 120_000 }, async (t) => {
+test('5画面とホスト分離の主要APIを一連の流れで確認する', { timeout: 120_000 }, async (t) => {
   // この2点はサブテスト化しない。失敗時は以降を止め、外部画像APIへの誤送信や
   // 前回データへの上書きを防ぐためのフェイルクローズ確認である。
   const health = await expectJson(publicBaseUrl, '/api/health');
@@ -90,6 +90,13 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
   );
   assert.equal(health.queues?.image?.concurrency, 2);
   assert.equal(health.queues?.text?.concurrency, 2);
+  assert.equal(health.careerCardOutfit?.mode, 'mock');
+  assert.equal(health.careerCardOutfit?.ready, true);
+  assert.equal(health.careerCardOutfit?.sendsParticipantPhoto, false);
+  assert.equal(health.careerCardCompositor?.mode, 'smart');
+  assert.equal(health.careerCardCompositor?.ready, true);
+  assert.equal(health.careerCardCompositor?.localOnly, true);
+  assert.equal(health.careerCardCompositor?.sendsParticipantPhoto, false);
 
   const initialHostState = await expectJson(hostBaseUrl, '/api/host/state');
   assert.equal(
@@ -101,6 +108,18 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
 
   await t.test('テストモードとホスト分離', async () => {
     assert.equal(health.textAi?.ok, true);
+
+    const careerCardPage = await fetch(`${publicBaseUrl}/career-card`);
+    assert.equal(careerCardPage.status, 200);
+    assert.match(careerCardPage.headers.get('content-type') || '', /^text\/html\b/);
+    assert.match(careerCardPage.headers.get('content-security-policy') || '', /worker-src 'self'/);
+    assert.match(careerCardPage.headers.get('content-security-policy') || '', /wasm-unsafe-eval/);
+
+    const mediaPipeRuntime = await fetch(`${publicBaseUrl}/vendor/mediapipe/vision_bundle.mjs`, { method: 'HEAD' });
+    assert.equal(mediaPipeRuntime.status, 200);
+    assert.match(mediaPipeRuntime.headers.get('content-type') || '', /javascript/);
+    const faceModel = await fetch(`${publicBaseUrl}/models/face_landmarker.task`, { method: 'HEAD' });
+    assert.equal(faceModel.status, 200);
 
     await expectApiError(publicBaseUrl, '/host', undefined, 404, 'NOT_FOUND');
     await expectApiError(publicBaseUrl, '/api/host/state', undefined, 404, 'NOT_FOUND');
@@ -196,6 +215,7 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
   await t.test('① 性別選択なしで、AI適応質問4回から実在する3職業を自由提案する', async () => {
     const config = await expectJson(publicBaseUrl, '/api/public-config');
     assert.equal('careerQuestions' in config, false, '固定職業質問を公開してはいけません。');
+    assert.equal(config.careerCardCompositor, 'smart');
 
     const started = await expectJson(publicBaseUrl, '/api/career/start', {
       method: 'POST',
@@ -297,6 +317,40 @@ test('4アプリとホスト分離の主要APIを一連の流れで確認する'
     );
 
     const selected = recommendation.careers[2];
+
+    const outfit = await expectJson(publicBaseUrl, '/api/career-card/outfit', {
+      method: 'POST',
+      body: { careerId: selected.careerId },
+    });
+    assert.equal(outfit.mock, true);
+    assert.equal(outfit.job, selected.job);
+    assert.equal(outfit.participantPhotoSent, false);
+    assert.deepEqual(outfit.faceSlot, {
+      centerX: 0.5,
+      centerY: 0.31,
+      width: 0.34,
+      height: 0.44,
+      collarY: 0.52,
+      eyeDistance: 0.108,
+      eyeY: 0.315,
+    });
+    assert.ok(Object.values(outfit.faceSlot).every((value) => value > 0 && value < 1));
+    assert.match(outfit.outfitUrl, /^\/media\/career_card_outfit_[A-Za-z0-9_-]+\.png$/);
+    await expectPng(publicBaseUrl, outfit.outfitUrl);
+
+    const repeatedOutfit = await expectJson(publicBaseUrl, '/api/career-card/outfit', {
+      method: 'POST',
+      body: { careerId: selected.careerId },
+    });
+    assert.equal(repeatedOutfit.outfitUrl, outfit.outfitUrl);
+
+    await expectApiError(
+      publicBaseUrl,
+      '/api/career-card/outfit',
+      { method: 'POST', body: { careerId: selected.careerId, photoDataUrl: tinyPngDataUrl } },
+      400,
+      'PHOTO_NOT_ACCEPTED',
+    );
 
     const generated = await expectJson(publicBaseUrl, '/api/career/generate', {
       method: 'POST',

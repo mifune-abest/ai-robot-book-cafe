@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import sharp from 'sharp';
 import { ImageService } from '../src/services/image-service.js';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEklEQVQImWPILjqZXXSSAUIBACy+BpkBZOd5AAAAAElFTkSuQmCC', 'base64');
@@ -8,6 +9,7 @@ const photo = { buffer: png, mime: 'image/png' };
 function imageConfig(overrides = {}) {
   return {
     imageProvider: 'codex',
+    careerCardOutfitProvider: 'codex',
     adultTestMode: false,
     ...overrides,
   };
@@ -33,6 +35,38 @@ test('Codex実画像生成は成人テスト指定なしでは開始しない', 
     (error) => error?.code === 'ADULT_TEST_REQUIRED' && error?.status === 412,
   );
   assert.equal(codex.calls.length, 0);
+});
+
+test('⑤ 完成人物の職業場面は本人写真なしでCodexへ職業だけを渡す', async () => {
+  const codex = fakeCodex();
+  const service = new ImageService(imageConfig(), codex);
+
+  const result = await service.careerCardOutfit({
+    job: 'ラジオパーソナリティ',
+    visualMotif: '放送スタジオとマイク',
+  });
+
+  assert.equal(service.careerCardOutfitStatus().model, 'gpt-image-2');
+  assert.equal(service.careerCardOutfitStatus().external, true);
+  assert.equal(codex.calls.length, 1);
+  assert.match(codex.calls[0].prompt, /career-label>ラジオパーソナリティ<\/career-label/);
+  assert.match(codex.calls[0].prompt, /complete, highly realistic occupational portrait/);
+  assert.match(codex.calls[0].prompt, /realistic job-appropriate clothing, safe tools or props, an authentic action or pose/);
+  assert.match(codex.calls[0].prompt, /Generate the complete person and scene together/);
+  assert.match(codex.calls[0].prompt, /anatomically coherent photograph/);
+  assert.match(codex.calls[0].prompt, /believable connection from jaw to neck to shoulders/);
+  assert.match(codex.calls[0].prompt, /Keep the complete face unobstructed/);
+  assert.match(codex.calls[0].prompt, /generated facial identity will be replaced only inside the face oval on the local PC/);
+  assert.match(codex.calls[0].prompt, /gender-neutral natural body proportions and practical occupational clothing/);
+  assert.match(codex.calls[0].prompt, /no participant gender or appearance information is sent/);
+  assert.match(codex.calls[0].prompt, /No other people, faces, heads/);
+  assert.match(codex.calls[0].prompt, /No participant photo is attached or available/);
+  assert.match(codex.calls[0].prompt, /放送スタジオとマイク/);
+  assert.doesNotMatch(codex.calls[0].prompt, /leave a head space|Show no exposed skin or hands|high closed neckline/i);
+  assert.deepEqual(codex.calls[0].references, []);
+  const metadata = await sharp(result).metadata();
+  assert.equal(metadata.width, 1024);
+  assert.equal(metadata.height, 1024);
 });
 
 test('① 職業画像は職業名を中心に服装・道具・背景を推定する', async () => {

@@ -22,6 +22,8 @@ export const config = Object.freeze({
   codexCommand: process.env.CODEX_COMMAND || 'codex',
   codexAppServerModel: process.env.CODEX_APP_SERVER_MODEL || 'gpt-5.5',
   imageProvider: process.env.IMAGE_PROVIDER || 'mock',
+  careerCardOutfitProvider: process.env.CAREER_CARD_OUTFIT_PROVIDER || process.env.IMAGE_PROVIDER || 'mock',
+  careerCardCompositor: process.env.CAREER_CARD_COMPOSITOR || 'smart',
   adultTestMode: process.env.ADULT_TEST_MODE === 'true',
   testMode: process.env.APP_TEST_MODE === '1',
   requestTimeoutMs: numberFromEnv('AI_TIMEOUT_MS', 180_000),

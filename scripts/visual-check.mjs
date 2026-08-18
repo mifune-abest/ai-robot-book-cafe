@@ -50,7 +50,10 @@ async function capture({ name, base, route, width, height }) {
   const page = await context.newPage();
   page.on('pageerror', (error) => errors.push(`${name}: ${error.message}`));
   page.on('console', (message) => {
-    if (message.type() === 'error') errors.push(`${name}: console ${message.text()}`);
+    const value = message.text();
+    if (message.type() === 'error' && !value.startsWith('INFO: Created TensorFlow Lite XNNPACK delegate')) {
+      errors.push(`${name}: console ${value}`);
+    }
   });
   const response = await page.goto(`${base}${route}`, { waitUntil: 'domcontentloaded', timeout: 20_000 });
   if (!response?.ok()) errors.push(`${name}: HTTP ${response?.status()}`);
@@ -82,7 +85,10 @@ async function captureCareerRecommendations({ width, height }) {
   const page = await context.newPage();
   page.on('pageerror', (error) => errors.push(`${name}: ${error.message}`));
   page.on('console', (message) => {
-    if (message.type() === 'error') errors.push(`${name}: console ${message.text()}`);
+    const value = message.text();
+    if (message.type() === 'error' && !value.startsWith('INFO: Created TensorFlow Lite XNNPACK delegate')) {
+      errors.push(`${name}: console ${value}`);
+    }
   });
   await page.goto(`${publicBase}/career`, { waitUntil: 'domcontentloaded', timeout: 20_000 });
   for (let index = 0; index < 4; index += 1) {
@@ -117,6 +123,7 @@ try {
   const publicRoutes = [
     ['home', '/'],
     ['career', '/career'],
+    ['career-card', '/career-card'],
     ['craft', '/craft'],
     ['dream', '/dream'],
     ['memory', '/memory'],

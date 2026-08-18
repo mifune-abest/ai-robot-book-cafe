@@ -1,4 +1,11 @@
 import { refreshFurigana, startFurigana } from './furigana.js';
+import {
+  applyColorTransferChannel,
+  calculateColorTransfer,
+  createIdentityPreservingTargetPoints,
+  LOCAL_FACE_ERROR_MESSAGES,
+  triangleAffineTransform,
+} from './local-face-compositor-math.js';
 
 startFurigana();
 
@@ -14,6 +21,7 @@ const ROUTES = {
   "/craft": { key: "craft", label: "デニムこうさく" },
   "/dream": { key: "dream", label: "りそうの ○○" },
   "/memory": { key: "memory", label: "きょうの おもいで" },
+  "/career-card": { key: "career-card", label: "おしごとカード" },
   "/host": { key: "host", label: "ホスト管理" },
 };
 
@@ -23,6 +31,7 @@ const CAREER_KIND_META = {
 
 const CAREER_TOTAL_STEPS = 4;
 const CAREER_IMAGE_ESTIMATE_MS = 180_000;
+const LOCAL_FACE_COMPOSITOR_TIMEOUT_MS = 45_000;
 const DREAM_TOTAL_QUESTIONS = 5;
 
 const DEFAULT_CONFIG = {
@@ -46,6 +55,7 @@ const DEFAULT_CONFIG = {
   memory: {
     tables: [],
   },
+  careerCardCompositor: "smart",
 };
 
 const state = {
@@ -66,12 +76,26 @@ const state = {
   host: null,
 };
 
+const localFaceCompositor = {
+  worker: null,
+  pending: new Map(),
+  nextId: 0,
+};
+
 class ApiError extends Error {
   constructor(message, status, data) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.data = data;
+  }
+}
+
+class LocalFaceCompositorError extends Error {
+  constructor(code) {
+    super(LOCAL_FACE_ERROR_MESSAGES[code] || LOCAL_FACE_ERROR_MESSAGES.COMPOSITOR_FAILED);
+    this.name = "LocalFaceCompositorError";
+    this.code = code || "COMPOSITOR_FAILED";
   }
 }
 
@@ -135,6 +159,105 @@ function apiGet(path) {
 
 function apiPost(path, body) {
   return apiRequest(path, { method: "POST", body: body || {} });
+}
+
+function disposeLocalFaceWorker(code) {
+  const reason = new LocalFaceCompositorError(code || "COMPOSITOR_FAILED");
+  localFaceCompositor.pending.forEach(function (request) {
+    window.clearTimeout(request.timeout);
+    request.reject(reason);
+  });
+  localFaceCompositor.pending.clear();
+  if (localFaceCompositor.worker) localFaceCompositor.worker.terminate();
+  localFaceCompositor.worker = null;
+}
+
+function ensureLocalFaceWorker() {
+  if (localFaceCompositor.worker) return localFaceCompositor.worker;
+  const worker = new Worker("/workers/local-face-compositor-worker.js");
+  worker.addEventListener("message", function (event) {
+    const value = event.data || {};
+    const request = localFaceCompositor.pending.get(value.id);
+    if (!request) return;
+    window.clearTimeout(request.timeout);
+    localFaceCompositor.pending.delete(value.id);
+    if (!value.ok) {
+      request.reject(new LocalFaceCompositorError(value.code));
+      return;
+    }
+    request.resolve(value);
+  });
+  worker.addEventListener("error", function () {
+    if (localFaceCompositor.worker === worker) {
+      disposeLocalFaceWorker("COMPOSITOR_FAILED");
+    }
+  });
+  localFaceCompositor.worker = worker;
+  worker.postMessage({ type: "init" });
+  return worker;
+}
+
+function careerCardCompositorMode() {
+  return state.config?.careerCardCompositor === "classic" ? "classic" : "smart";
+}
+
+function prewarmLocalFaceCompositor() {
+  if (careerCardCompositorMode() !== "smart") return;
+  try {
+    ensureLocalFaceWorker();
+  } catch (error) {
+    // 実際の生成時に、撮り直しやスタッフ案内を含む画面で停止する。
+  }
+}
+
+function requestLocalFaceAnalysis(image, purpose) {
+  return new Promise(function (resolve, reject) {
+    let worker;
+    try {
+      worker = ensureLocalFaceWorker();
+    } catch (error) {
+      reject(new LocalFaceCompositorError("MODEL_UNAVAILABLE"));
+      return;
+    }
+    createImageBitmap(image).then(function (bitmap) {
+      const id = ++localFaceCompositor.nextId;
+      const timeout = window.setTimeout(function () {
+        disposeLocalFaceWorker("COMPOSITOR_TIMEOUT");
+      }, LOCAL_FACE_COMPOSITOR_TIMEOUT_MS);
+      localFaceCompositor.pending.set(id, { resolve, reject, timeout });
+      try {
+        worker.postMessage({
+          type: "analyze",
+          id,
+          bitmap,
+          purpose: purpose === "target" ? "target" : "participant",
+        }, [bitmap]);
+      } catch (error) {
+        window.clearTimeout(timeout);
+        localFaceCompositor.pending.delete(id);
+        if (typeof bitmap.close === "function") bitmap.close();
+        reject(new LocalFaceCompositorError("COMPOSITOR_FAILED"));
+      }
+    }).catch(function () {
+      reject(new LocalFaceCompositorError("MODEL_UNAVAILABLE"));
+    });
+  });
+}
+
+async function analyzeParticipantPhoto(image, purpose) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await requestLocalFaceAnalysis(image, purpose);
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof LocalFaceCompositorError) || error.code !== "COMPOSITOR_FAILED") {
+        throw error;
+      }
+      disposeLocalFaceWorker("COMPOSITOR_FAILED");
+    }
+  }
+  throw lastError || new LocalFaceCompositorError("COMPOSITOR_FAILED");
 }
 
 function cleanPathname(pathname) {
@@ -252,6 +375,10 @@ function clearTransientState() {
   state.careerImageProgressTimer = null;
   toast.hidden = true;
   stopCamera();
+  if (state.career) {
+    state.career.photoDataUrl = "";
+    state.career.resultImageUrl = "";
+  }
   if ("speechSynthesis" in window) {
     window.speechSynthesis.cancel();
   }
@@ -311,14 +438,17 @@ function careerImageTimeLabel(remainingMs) {
   return "あと 約" + minutes + "分";
 }
 
-function careerImageLoadingScreen(job) {
+function careerImageLoadingScreen(job, options) {
+  const settings = options || {};
   stopCareerImageProgress();
   setView(
     '<section class="screen screen--center screen--narrow">' +
       "<h1>" +
-      escapeHtml(job) +
-      "に へんしん中！</h1>" +
-      '<p class="lead">すてきな しゃしんを つくっているよ</p>' +
+      escapeHtml(settings.title || job + "に へんしん中！") +
+      "</h1>" +
+      '<p class="lead">' +
+      escapeHtml(settings.lead || "すてきな しゃしんを つくっているよ") +
+      "</p>" +
       '<div class="generation-progress">' +
       '<div class="generation-progress__labels"><span>できあがりまでの めやす</span>' +
       '<strong id="career-image-time" aria-live="polite">あと 約3分</strong></div>' +
@@ -350,6 +480,14 @@ function careerImageLoadingScreen(job) {
   };
   update();
   state.careerImageProgressTimer = window.setInterval(update, 1_000);
+}
+
+function updateCareerImageLoadingText(title, lead) {
+  const heading = app.querySelector("h1");
+  const copy = app.querySelector(".lead");
+  if (heading) heading.textContent = title;
+  if (copy) copy.textContent = lead;
+  refreshFurigana(app);
 }
 
 function errorScreen(options) {
@@ -568,6 +706,10 @@ async function checkHealth() {
   try {
     const response = await apiGet("/api/health");
     const value = unwrapData(response);
+    const imageRequired = ["career", "craft", "dream", "memory"].includes(
+      state.route && state.route.key,
+    );
+    const careerCardOutfitRequired = state.route && state.route.key === "career-card";
     state.healthy = !(
       value &&
       typeof value === "object" &&
@@ -575,7 +717,12 @@ async function checkHealth() {
         value.healthy === false ||
         value.status === "error" ||
         (value.textAi && value.textAi.ok === false) ||
-        (value.image && value.image.ready === false))
+        (imageRequired && value.image && value.image.ready === false) ||
+        (careerCardOutfitRequired &&
+          (!value.careerCardOutfit ||
+            value.careerCardOutfit.ready === false ||
+            !value.careerCardCompositor ||
+            value.careerCardCompositor.ready === false)))
     );
   } catch (error) {
     state.healthy = false;
@@ -631,18 +778,30 @@ function renderHome() {
   setView(
     '<section class="screen">' +
       '<div class="screen-heading"><p class="eyebrow">スタッフ用 スタート</p>' +
-      '<h1 data-autofocus tabindex="-1">ひらく アプリを えらぶ</h1></div>' +
+      '<h1 class="home-title" data-autofocus tabindex="-1"><span>ひらく アプリを</span> <span>えらぶ</span></h1></div>' +
       '<nav class="home-grid" aria-label="アプリ一覧">' +
       '<a class="route-card" href="/career"><span class="route-card__number">1</span><span>しごとに へんしん</span></a>' +
       '<a class="route-card" href="/craft"><span class="route-card__number">2</span><span>デニムこうさく</span></a>' +
       '<a class="route-card" href="/dream"><span class="route-card__number">3</span><span>りそうの ○○</span></a>' +
       '<a class="route-card" href="/memory"><span class="route-card__number">4</span><span>きょうの おもいで</span></a>' +
+      '<a class="route-card route-card--wide" href="/career-card"><span class="route-card__number">5</span>' +
+      '<span class="choice-copy"><span>おしごとカード</span><span class="choice-note">しゃしんは このPCの なかだけ</span></span></a>' +
       "</nav></section>",
   );
 }
 
 function initCareer() {
+  initCareerFlow("ai-transform");
+}
+
+function initCareerCard() {
+  initCareerFlow("local-card");
+  prewarmLocalFaceCompositor();
+}
+
+function initCareerFlow(outputMode) {
   state.career = {
+    outputMode: outputMode,
     sessionId: "",
     step: 1,
     total: CAREER_TOTAL_STEPS,
@@ -650,10 +809,20 @@ function initCareer() {
     recommendations: [],
     selectedCareer: null,
     photoDataUrl: "",
+    outfitImageUrl: "",
     resultImageUrl: "",
   };
   state.hasProgress = false;
   startCareerInterview();
+}
+
+function isLocalCareerCard() {
+  return state.career && state.career.outputMode === "local-card";
+}
+
+function restartCareerFlow() {
+  if (isLocalCareerCard()) initCareerCard();
+  else initCareer();
 }
 
 function normalizeCareerInterviewQuestion(response) {
@@ -828,7 +997,7 @@ async function requestCareerRecommendations() {
       message: formatChildError(error),
       retry: requestCareerRecommendations,
       retryLabel: "もういちど さがす",
-      back: initCareer,
+      back: restartCareerFlow,
       backLabel: "はじめから やりなおす",
     });
   }
@@ -853,7 +1022,9 @@ function renderCareerRecommendations() {
       "</p>" +
       '<button class="button" type="button" data-career-index="' +
       index +
-      '">このしごとに なる！</button></article>';
+      '">' +
+      (isLocalCareerCard() ? "このしごとで カードを つくる" : "このしごとに なる！") +
+      "</button></article>";
   });
 
   setView(
@@ -879,7 +1050,8 @@ function renderCareerRecommendations() {
 function renderCareerCamera(cameraError) {
   const selected = state.career.selectedCareer;
   const privatePhotoReady = window.isSecureContext || isLoopbackHost();
-  if (!privatePhotoReady) {
+  const localCard = isLocalCareerCard();
+  if (!privatePhotoReady && !localCard) {
     stopCamera();
     setView(
       '<section class="screen screen--center screen--narrow"><div class="status-icon status-icon--error" aria-hidden="true">鍵</div>' +
@@ -903,12 +1075,19 @@ function renderCareerCamera(cameraError) {
       '<div class="camera-copy"><p class="eyebrow">' +
       escapeHtml(selected.name) +
       "</p>" +
+      (localCard
+        ? '<p class="local-photo-badge">しゃしんは このPCの なかだけ</p>'
+        : "") +
       "<h1>かおを わくに あわせてね</h1>" +
-      '<p class="lead">まえを むいて にっこり！</p>' +
+      '<p class="lead">' +
+      (privatePhotoReady ? "まえを むいて にっこり！" : "しゃしんを えらんでね") +
+      "</p>" +
       '<div class="actions">' +
       (hasStream
         ? '<button class="button" id="take-photo" type="button">しゃしんを とる</button>'
-        : '<button class="button" id="retry-camera" type="button">カメラを つかう</button>') +
+        : privatePhotoReady
+          ? '<button class="button" id="retry-camera" type="button">カメラを つかう</button>'
+          : "") +
       '<button class="button button--secondary" id="choose-photo" type="button">しゃしんを えらぶ</button>' +
       '<input class="visually-hidden" id="career-photo-file" type="file" accept="image/jpeg,image/png,image/webp" />' +
       '<button class="button button--secondary" id="back-to-careers" type="button">しごとを えらびなおす</button>' +
@@ -920,7 +1099,8 @@ function renderCareerCamera(cameraError) {
     video.srcObject = state.cameraStream;
     document.querySelector("#take-photo").addEventListener("click", capturePhoto);
   } else {
-    document.querySelector("#retry-camera").addEventListener("click", beginCamera);
+    const retryCamera = document.querySelector("#retry-camera");
+    if (retryCamera) retryCamera.addEventListener("click", beginCamera);
   }
   const fileInput = document.querySelector("#career-photo-file");
   document.querySelector("#choose-photo").addEventListener("click", function () {
@@ -940,7 +1120,11 @@ async function beginCamera() {
   stopCamera();
   const requestId = state.cameraRequestId;
   if (!(window.isSecureContext || isLoopbackHost())) {
-    renderCareerCamera();
+    renderCareerCamera(
+      isLocalCareerCard()
+        ? "カメラは つかえないよ。しゃしんを えらんでね"
+        : "",
+    );
     return;
   }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -1047,6 +1231,7 @@ function capturePhoto() {
 }
 
 function renderCareerPhotoReview() {
+  const localCard = isLocalCareerCard();
   setView(
     '<section class="screen"><div class="camera-layout">' +
       '<div class="camera-frame"><img class="photo-preview" src="' +
@@ -1055,21 +1240,33 @@ function renderCareerPhotoReview() {
       '<div class="camera-copy"><p class="eyebrow">' +
       escapeHtml(state.career.selectedCareer.name) +
       "</p>" +
+      (localCard
+        ? '<p class="local-photo-badge">しゃしんは このPCの なかだけ</p>'
+        : "") +
       "<h1>このしゃしんで いい？</h1>" +
       '<div class="actions">' +
-      '<button class="button" id="generate-career" type="button">このしゃしんで つくる</button>' +
+      '<button class="button" id="generate-career" type="button">' +
+      (localCard ? "このしゃしんで カードを つくる" : "このしゃしんで つくる") +
+      "</button>" +
       '<button class="button button--secondary" id="retake-photo" type="button">とりなおす</button>' +
       "</div></div></div></section>",
   );
   document.querySelector("#generate-career").addEventListener("click", generateCareerImage);
-  document.querySelector("#retake-photo").addEventListener("click", function () {
-    state.career.photoDataUrl = "";
-    renderCareerCamera();
-    beginCamera();
-  });
+  document.querySelector("#retake-photo").addEventListener("click", retakeCareerPhoto);
+}
+
+function retakeCareerPhoto() {
+  state.career.photoDataUrl = "";
+  state.career.resultImageUrl = "";
+  renderCareerCamera();
+  beginCamera();
 }
 
 async function generateCareerImage() {
+  if (isLocalCareerCard()) {
+    await generateLocalCareerCard();
+    return;
+  }
   careerImageLoadingScreen(state.career.selectedCareer.name);
   try {
     const response = await apiPost("/api/career/generate", {
@@ -1095,7 +1292,822 @@ async function generateCareerImage() {
   }
 }
 
+function loadBrowserImage(source) {
+  return new Promise(function (resolve, reject) {
+    const image = new Image();
+    image.addEventListener("load", function () {
+      resolve(image);
+    });
+    image.addEventListener("error", function () {
+      reject(new Error("画像を開けませんでした"));
+    });
+    image.src = source;
+  });
+}
+
+async function localReading(text) {
+  try {
+    const response = await apiPost("/api/furigana", { texts: [text] });
+    const segments = response && response.items && response.items[0] && response.items[0].segments;
+    if (!Array.isArray(segments)) return "";
+    const reading = segments.map(function (segment) {
+      return segment.reading || segment.text || "";
+    }).join("");
+    return reading === text ? "" : reading;
+  } catch (error) {
+    return "";
+  }
+}
+
+function roundedRectangle(context, x, y, width, height, radius) {
+  const r = Math.min(radius, width / 2, height / 2);
+  context.beginPath();
+  context.moveTo(x + r, y);
+  context.lineTo(x + width - r, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + r);
+  context.lineTo(x + width, y + height - r);
+  context.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  context.lineTo(x + r, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - r);
+  context.lineTo(x, y + r);
+  context.quadraticCurveTo(x, y, x + r, y);
+  context.closePath();
+}
+
+function drawImageCover(context, image, x, y, width, height, focusY) {
+  const imageWidth = image.naturalWidth || image.width;
+  const imageHeight = image.naturalHeight || image.height;
+  const scale = Math.max(width / imageWidth, height / imageHeight);
+  const sourceWidth = width / scale;
+  const sourceHeight = height / scale;
+  const sourceX = Math.max(0, (imageWidth - sourceWidth) / 2);
+  const sourceY = Math.max(
+    0,
+    (imageHeight - sourceHeight) * (focusY == null ? 0.38 : focusY),
+  );
+  context.drawImage(
+    image,
+    sourceX,
+    sourceY,
+    Math.min(sourceWidth, imageWidth),
+    Math.min(sourceHeight, imageHeight),
+    x,
+    y,
+    width,
+    height,
+  );
+}
+
+function drawParticipantFaceClassic(context, image, x, y, width, height) {
+  const destinationRatio = width / height;
+  const portrait = image.naturalHeight > image.naturalWidth * 1.1;
+  const sourceWidth = Math.min(
+    image.naturalWidth * 0.72,
+    image.naturalHeight * destinationRatio * 0.7,
+  );
+  const sourceHeight = sourceWidth / destinationRatio;
+  const centerX = image.naturalWidth / 2;
+  const centerY = image.naturalHeight * (portrait ? 0.35 : 0.44);
+  const sourceX = Math.max(0, Math.min(image.naturalWidth - sourceWidth, centerX - sourceWidth / 2));
+  const sourceY = Math.max(0, Math.min(image.naturalHeight - sourceHeight, centerY - sourceHeight / 2));
+  context.drawImage(
+    image,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    x,
+    y,
+    width,
+    height,
+  );
+}
+
+function decodeFaceLandmarks(analysis, width, height) {
+  const count = Number(analysis?.landmarks?.count || 0);
+  const values = new Float32Array(analysis?.landmarks?.data || new ArrayBuffer(0));
+  if (count < 468 || values.length !== count * 3) {
+    throw new LocalFaceCompositorError("COMPOSITOR_FAILED");
+  }
+  return Array.from({ length: count }, function (_, index) {
+    const offset = index * 3;
+    return {
+      x: values[offset] * width,
+      y: values[offset + 1] * height,
+      z: values[offset + 2],
+    };
+  });
+}
+
+function decodeFaceMesh(analysis) {
+  const triangles = new Uint16Array(analysis?.mesh?.triangles || new ArrayBuffer(0));
+  const faceOval = new Uint16Array(analysis?.mesh?.faceOval || new ArrayBuffer(0));
+  if (triangles.length < 300 || triangles.length % 3 !== 0 || faceOval.length < 24) {
+    throw new LocalFaceCompositorError("COMPOSITOR_FAILED");
+  }
+  return { triangles, faceOval };
+}
+
+function polygonCenter(points) {
+  return points.reduce(function (value, point) {
+    value.x += point.x / points.length;
+    value.y += point.y / points.length;
+    return value;
+  }, { x: 0, y: 0 });
+}
+
+function insetPolygon(points, scaleX, scaleY) {
+  const center = polygonCenter(points);
+  return points.map(function (point) {
+    return {
+      x: center.x + (point.x - center.x) * scaleX,
+      y: center.y + (point.y - center.y) * scaleY,
+    };
+  });
+}
+
+function polygonBounds(points, width, height) {
+  const bounds = points.reduce(function (value, point) {
+    return {
+      minX: Math.min(value.minX, point.x),
+      maxX: Math.max(value.maxX, point.x),
+      minY: Math.min(value.minY, point.y),
+      maxY: Math.max(value.maxY, point.y),
+    };
+  }, { minX: width, maxX: 0, minY: height, maxY: 0 });
+  return {
+    minX: Math.max(0, Math.floor(bounds.minX)),
+    maxX: Math.min(width - 1, Math.ceil(bounds.maxX)),
+    minY: Math.max(0, Math.floor(bounds.minY)),
+    maxY: Math.min(height - 1, Math.ceil(bounds.maxY)),
+  };
+}
+
+function pointInsidePolygon(x, y, polygon) {
+  let inside = false;
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
+    const currentPoint = polygon[index];
+    const previousPoint = polygon[previous];
+    const verticalDifference = previousPoint.y - currentPoint.y;
+    const crosses = (currentPoint.y > y) !== (previousPoint.y > y) &&
+      x < ((previousPoint.x - currentPoint.x) * (y - currentPoint.y)) /
+        (Math.abs(verticalDifference) < 0.00001 ? 0.00001 : verticalDifference) + currentPoint.x;
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+function imageCanvas(image) {
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function measureFaceColor(canvas, polygon) {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const bounds = polygonBounds(polygon, canvas.width, canvas.height);
+  const image = context.getImageData(
+    bounds.minX,
+    bounds.minY,
+    Math.max(1, bounds.maxX - bounds.minX + 1),
+    Math.max(1, bounds.maxY - bounds.minY + 1),
+  );
+  const sums = [0, 0, 0];
+  const squares = [0, 0, 0];
+  let count = 0;
+  for (let localY = 0; localY < image.height; localY += 2) {
+    for (let localX = 0; localX < image.width; localX += 2) {
+      const x = bounds.minX + localX;
+      const y = bounds.minY + localY;
+      if (!pointInsidePolygon(x, y, polygon)) continue;
+      const offset = (localY * image.width + localX) * 4;
+      const red = image.data[offset];
+      const green = image.data[offset + 1];
+      const blue = image.data[offset + 2];
+      const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+      if (luminance < 38 || luminance > 242) continue;
+      [red, green, blue].forEach(function (value, channel) {
+        sums[channel] += value;
+        squares[channel] += value * value;
+      });
+      count += 1;
+    }
+  }
+  if (count < 120) return null;
+  const mean = sums.map(function (value) { return value / count; });
+  const deviation = squares.map(function (value, channel) {
+    return Math.sqrt(Math.max(1, value / count - mean[channel] * mean[channel]));
+  });
+  return { mean, deviation, count };
+}
+
+function colorMatchedParticipant(participantImage, sourcePoints, targetImage, targetPoints, ovalIndices) {
+  const sourceCanvas = imageCanvas(participantImage);
+  const targetCanvas = imageCanvas(targetImage);
+  const sourceOval = insetPolygon(Array.from(ovalIndices, function (index) { return sourcePoints[index]; }), 0.72, 0.78);
+  const targetOval = insetPolygon(Array.from(ovalIndices, function (index) { return targetPoints[index]; }), 0.72, 0.78);
+  const transfer = calculateColorTransfer(
+    measureFaceColor(sourceCanvas, sourceOval),
+    measureFaceColor(targetCanvas, targetOval),
+  );
+  if (!transfer) return sourceCanvas;
+
+  const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
+  const outerOval = Array.from(ovalIndices, function (index) { return sourcePoints[index]; });
+  const bounds = polygonBounds(outerOval, sourceCanvas.width, sourceCanvas.height);
+  const image = context.getImageData(
+    bounds.minX,
+    bounds.minY,
+    Math.max(1, bounds.maxX - bounds.minX + 1),
+    Math.max(1, bounds.maxY - bounds.minY + 1),
+  );
+  for (let localY = 0; localY < image.height; localY += 1) {
+    for (let localX = 0; localX < image.width; localX += 1) {
+      const x = bounds.minX + localX;
+      const y = bounds.minY + localY;
+      if (!pointInsidePolygon(x, y, outerOval)) continue;
+      const offset = (localY * image.width + localX) * 4;
+      for (let channel = 0; channel < 3; channel += 1) {
+        image.data[offset + channel] = applyColorTransferChannel(
+          image.data[offset + channel],
+          channel,
+          transfer,
+        );
+      }
+    }
+  }
+  context.putImageData(image, bounds.minX, bounds.minY);
+  return sourceCanvas;
+}
+
+function expandedTriangle(points, pixels) {
+  const center = polygonCenter(points);
+  return points.map(function (point) {
+    const distance = Math.max(1, Math.hypot(point.x - center.x, point.y - center.y));
+    const scale = 1 + pixels / distance;
+    return {
+      x: center.x + (point.x - center.x) * scale,
+      y: center.y + (point.y - center.y) * scale,
+    };
+  });
+}
+
+function drawFaceMeshWarp(context, sourceCanvas, sourcePoints, targetPoints, triangleIndices) {
+  let drawn = 0;
+  for (let index = 0; index < triangleIndices.length; index += 3) {
+    const indices = [triangleIndices[index], triangleIndices[index + 1], triangleIndices[index + 2]];
+    const sourceTriangle = indices.map(function (pointIndex) { return sourcePoints[pointIndex]; });
+    const targetTriangle = indices.map(function (pointIndex) { return targetPoints[pointIndex]; });
+    const transform = triangleAffineTransform(sourceTriangle, targetTriangle);
+    if (!transform) continue;
+    const area = Math.abs(
+      (targetTriangle[1].x - targetTriangle[0].x) * (targetTriangle[2].y - targetTriangle[0].y) -
+      (targetTriangle[2].x - targetTriangle[0].x) * (targetTriangle[1].y - targetTriangle[0].y),
+    ) / 2;
+    if (area < 0.08) continue;
+    const clipTriangle = expandedTriangle(targetTriangle, 0.9);
+    context.save();
+    context.beginPath();
+    context.moveTo(clipTriangle[0].x, clipTriangle[0].y);
+    context.lineTo(clipTriangle[1].x, clipTriangle[1].y);
+    context.lineTo(clipTriangle[2].x, clipTriangle[2].y);
+    context.closePath();
+    context.clip();
+    context.setTransform(transform.a, transform.b, transform.c, transform.d, transform.e, transform.f);
+    context.drawImage(sourceCanvas, 0, 0);
+    context.restore();
+    drawn += 1;
+  }
+  if (drawn < 500) throw new LocalFaceCompositorError("COMPOSITOR_FAILED");
+}
+
+function createSoftFaceMask(targetPoints, ovalIndices, width, height) {
+  const mask = document.createElement("canvas");
+  mask.width = width;
+  mask.height = height;
+  const context = mask.getContext("2d");
+  const oval = insetPolygon(Array.from(ovalIndices, function (index) { return targetPoints[index]; }), 0.93, 0.945);
+  context.fillStyle = "#ffffff";
+  context.beginPath();
+  context.moveTo(oval[0].x, oval[0].y);
+  oval.slice(1).forEach(function (point) { context.lineTo(point.x, point.y); });
+  context.closePath();
+  context.fill();
+
+  const softMask = document.createElement("canvas");
+  softMask.width = width;
+  softMask.height = height;
+  const softContext = softMask.getContext("2d");
+  softContext.filter = "blur(" + Math.max(14, Math.round(width * 0.018)) + "px)";
+  softContext.drawImage(mask, 0, 0);
+  softContext.filter = "none";
+  const top = Math.min.apply(null, oval.map(function (point) { return point.y; }));
+  const bottom = Math.max.apply(null, oval.map(function (point) { return point.y; }));
+  const foreheadFade = Math.max(42, (bottom - top) * 0.24);
+  const foreheadGradient = softContext.createLinearGradient(0, top - 6, 0, top + foreheadFade);
+  foreheadGradient.addColorStop(0, "rgba(255,255,255,0)");
+  foreheadGradient.addColorStop(1, "rgba(255,255,255,1)");
+  softContext.globalCompositeOperation = "destination-in";
+  softContext.fillStyle = foreheadGradient;
+  softContext.fillRect(0, 0, width, height);
+  softContext.globalCompositeOperation = "source-over";
+  return softMask;
+}
+
+function blurredFaceCanvas(canvas, pixels) {
+  const blurred = document.createElement("canvas");
+  blurred.width = canvas.width;
+  blurred.height = canvas.height;
+  const context = blurred.getContext("2d");
+  context.filter = "blur(" + pixels + "px)";
+  context.drawImage(canvas, 0, 0);
+  context.filter = "none";
+  return blurred;
+}
+
+function matchWarpedFaceLighting(
+  warpedFace,
+  targetImage,
+  targetPoints,
+  destinationPoints,
+  triangleIndices,
+  ovalIndices,
+) {
+  const warpedTarget = document.createElement("canvas");
+  warpedTarget.width = warpedFace.width;
+  warpedTarget.height = warpedFace.height;
+  const warpedTargetContext = warpedTarget.getContext("2d");
+  warpedTargetContext.imageSmoothingEnabled = true;
+  warpedTargetContext.imageSmoothingQuality = "high";
+  drawFaceMeshWarp(
+    warpedTargetContext,
+    imageCanvas(targetImage),
+    targetPoints,
+    destinationPoints,
+    triangleIndices,
+  );
+
+  const blurPixels = Math.max(12, Math.round(warpedFace.width * 0.016));
+  const sourceLowFrequency = blurredFaceCanvas(warpedFace, blurPixels);
+  const targetLowFrequency = blurredFaceCanvas(warpedTarget, blurPixels);
+  const context = warpedFace.getContext("2d", { willReadFrequently: true });
+  const oval = Array.from(ovalIndices, function (index) { return destinationPoints[index]; });
+  const bounds = polygonBounds(oval, warpedFace.width, warpedFace.height);
+  const width = Math.max(1, bounds.maxX - bounds.minX + 1);
+  const height = Math.max(1, bounds.maxY - bounds.minY + 1);
+  const source = context.getImageData(bounds.minX, bounds.minY, width, height);
+  const sourceLow = sourceLowFrequency.getContext("2d", { willReadFrequently: true })
+    .getImageData(bounds.minX, bounds.minY, width, height);
+  const targetLow = targetLowFrequency.getContext("2d", { willReadFrequently: true })
+    .getImageData(bounds.minX, bounds.minY, width, height);
+
+  const centerX = width / 2;
+  const centerY = height / 2;
+  for (let localY = 0; localY < height; localY += 1) {
+    for (let localX = 0; localX < width; localX += 1) {
+      const offset = (localY * width + localX) * 4;
+      const sourceAlpha = source.data[offset + 3] / 255;
+      if (sourceAlpha < 0.05) continue;
+      const targetAlpha = targetLow.data[offset + 3] / 255;
+      const radius = Math.hypot(
+        (localX - centerX) / Math.max(1, centerX),
+        (localY - centerY) / Math.max(1, centerY),
+      );
+      const edgeProgressValue = Math.max(0, Math.min(1, (radius - 0.62) / 0.38));
+      const edgeProgress = edgeProgressValue * edgeProgressValue * (3 - 2 * edgeProgressValue);
+      const targetWeight = (0.22 + edgeProgress * 0.78) *
+        Math.min(1, targetAlpha / Math.max(0.35, sourceAlpha));
+      const sourceWeight = 1 - targetWeight;
+      const detailStrength = 1.05 - edgeProgress * 0.7;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const sourceDetail = source.data[offset + channel] - sourceLow.data[offset + channel];
+        const sharedLighting =
+          sourceLow.data[offset + channel] * sourceWeight +
+          targetLow.data[offset + channel] * targetWeight;
+        source.data[offset + channel] = Math.max(
+          0,
+          Math.min(255, Math.round(sharedLighting + sourceDetail * detailStrength)),
+        );
+      }
+    }
+  }
+  context.putImageData(source, bounds.minX, bounds.minY);
+}
+
+function sharpenWarpedFace(canvas, targetPoints, ovalIndices) {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const oval = Array.from(ovalIndices, function (index) { return targetPoints[index]; });
+  const bounds = polygonBounds(oval, canvas.width, canvas.height);
+  const width = Math.max(1, bounds.maxX - bounds.minX + 1);
+  const height = Math.max(1, bounds.maxY - bounds.minY + 1);
+  const image = context.getImageData(bounds.minX, bounds.minY, width, height);
+  const source = new Uint8ClampedArray(image.data);
+  const amount = 0.42;
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const offset = (y * width + x) * 4;
+      if (source[offset + 3] < 245) continue;
+      const neighbors = [offset - 4, offset + 4, offset - width * 4, offset + width * 4];
+      for (let channel = 0; channel < 3; channel += 1) {
+        const center = source[offset + channel];
+        let total = center * 4;
+        neighbors.forEach(function (neighbor) {
+          total += source[neighbor + 3] > 200 ? source[neighbor + channel] : center;
+        });
+        const blurred = total / 8;
+        image.data[offset + channel] = Math.max(
+          0,
+          Math.min(255, Math.round(center + (center - blurred) * amount)),
+        );
+      }
+    }
+  }
+  context.putImageData(image, bounds.minX, bounds.minY);
+}
+
+function restoreTargetHair(context, targetImage, targetPoints, ovalIndices, width, height) {
+  const eyebrowIndices = [70, 63, 105, 66, 107, 300, 293, 334, 296, 336];
+  const eyebrowPoints = eyebrowIndices.map(function (index) { return targetPoints[index]; }).filter(Boolean);
+  if (eyebrowPoints.length !== eyebrowIndices.length) return;
+  const eyebrowY = eyebrowPoints.reduce(function (sum, point) { return sum + point.y; }, 0) /
+    eyebrowPoints.length;
+  const oval = Array.from(ovalIndices, function (index) { return targetPoints[index]; });
+  const bounds = polygonBounds(oval, width, height);
+  const bottom = Math.min(bounds.maxY, Math.ceil(eyebrowY - 4));
+  const overlayWidth = Math.max(1, bounds.maxX - bounds.minX + 1);
+  const overlayHeight = Math.max(1, bottom - bounds.minY + 1);
+  if (overlayHeight < 8) return;
+
+  const targetCanvas = document.createElement("canvas");
+  targetCanvas.width = width;
+  targetCanvas.height = height;
+  const targetContext = targetCanvas.getContext("2d", { willReadFrequently: true });
+  targetContext.drawImage(targetImage, 0, 0, width, height);
+  const pixels = targetContext.getImageData(bounds.minX, bounds.minY, overlayWidth, overlayHeight);
+  for (let localY = 0; localY < overlayHeight; localY += 1) {
+    const y = bounds.minY + localY;
+    const browFade = Math.max(0, Math.min(1, (eyebrowY - 4 - y) / 24));
+    for (let localX = 0; localX < overlayWidth; localX += 1) {
+      const offset = (localY * overlayWidth + localX) * 4;
+      const red = pixels.data[offset];
+      const green = pixels.data[offset + 1];
+      const blue = pixels.data[offset + 2];
+      const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+      const darkness = Math.max(0, Math.min(1, (118 - luminance) / 46));
+      pixels.data[offset + 3] = Math.round(pixels.data[offset + 3] * darkness * browFade);
+    }
+  }
+
+  const rawOverlay = document.createElement("canvas");
+  rawOverlay.width = width;
+  rawOverlay.height = height;
+  rawOverlay.getContext("2d").putImageData(pixels, bounds.minX, bounds.minY);
+  const softOverlay = document.createElement("canvas");
+  softOverlay.width = width;
+  softOverlay.height = height;
+  const softContext = softOverlay.getContext("2d");
+  softContext.filter = "blur(1.5px)";
+  softContext.drawImage(rawOverlay, 0, 0);
+  softContext.filter = "none";
+  context.drawImage(softOverlay, 0, 0);
+}
+
+function createSmartCareerPortrait(participantImage, targetImage, participantAnalysis, targetAnalysis) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1024;
+  canvas.height = 1024;
+  const context = canvas.getContext("2d");
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(targetImage, 0, 0, canvas.width, canvas.height);
+
+  const sourcePoints = decodeFaceLandmarks(
+    participantAnalysis,
+    participantImage.naturalWidth,
+    participantImage.naturalHeight,
+  );
+  const targetPoints = decodeFaceLandmarks(targetAnalysis, canvas.width, canvas.height);
+  const mesh = decodeFaceMesh(targetAnalysis);
+  const warpPlan = createIdentityPreservingTargetPoints(
+    sourcePoints,
+    targetPoints,
+  );
+  if (!warpPlan) throw new LocalFaceCompositorError("COMPOSITOR_FAILED");
+  const destinationPoints = warpPlan.points;
+  const matchedSource = colorMatchedParticipant(
+    participantImage,
+    sourcePoints,
+    targetImage,
+    targetPoints,
+    mesh.faceOval,
+  );
+  const warpedFace = document.createElement("canvas");
+  warpedFace.width = canvas.width;
+  warpedFace.height = canvas.height;
+  const warpedContext = warpedFace.getContext("2d");
+  warpedContext.imageSmoothingEnabled = true;
+  warpedContext.imageSmoothingQuality = "high";
+  drawFaceMeshWarp(warpedContext, matchedSource, sourcePoints, destinationPoints, mesh.triangles);
+  matchWarpedFaceLighting(
+    warpedFace,
+    targetImage,
+    targetPoints,
+    destinationPoints,
+    mesh.triangles,
+    mesh.faceOval,
+  );
+  sharpenWarpedFace(warpedFace, destinationPoints, mesh.faceOval);
+
+  const mask = createSoftFaceMask(destinationPoints, mesh.faceOval, canvas.width, canvas.height);
+  warpedContext.globalCompositeOperation = "destination-in";
+  warpedContext.drawImage(mask, 0, 0);
+  warpedContext.globalCompositeOperation = "source-over";
+  context.drawImage(warpedFace, 0, 0);
+  restoreTargetHair(context, targetImage, targetPoints, mesh.faceOval, canvas.width, canvas.height);
+  return canvas;
+}
+
+function careerCardTheme(job) {
+  const name = String(job || "");
+  if (/アイドル|歌手|俳優|声優|音楽|ダンサ|芸能|舞台/.test(name)) {
+    return { top: "#7c3aed", bottom: "#ec4899", ink: "#5b146f", motif: "stage" };
+  }
+  if (/ゲーム|プログラ|エンジニア|IT|データ|ロボット|CG|デジタル/.test(name)) {
+    return { top: "#075985", bottom: "#06b6d4", ink: "#083b66", motif: "tech" };
+  }
+  if (/研究|科学|学者|医師|看護|薬剤|療法|医療/.test(name)) {
+    return { top: "#0f766e", bottom: "#34d399", ink: "#075b55", motif: "science" };
+  }
+  if (/動物|獣医|自然|海洋|植物|農|漁|生物/.test(name)) {
+    return { top: "#3f6212", bottom: "#84cc16", ink: "#365314", motif: "nature" };
+  }
+  if (/作家|画家|デザイナ|イラスト|写真|映像|建築|料理|パティシエ/.test(name)) {
+    return { top: "#b45309", bottom: "#f59e0b", ink: "#78350f", motif: "creative" };
+  }
+  return { top: "#155e75", bottom: "#2dd4bf", ink: "#164e63", motif: "future" };
+}
+
+function drawCardMotifs(context, theme) {
+  context.save();
+  context.strokeStyle = "rgba(255,255,255,0.72)";
+  context.fillStyle = "rgba(255,255,255,0.72)";
+  context.lineWidth = 12;
+
+  if (theme.motif === "stage") {
+    [[55, 340], [1145, 680], [70, 1050], [1130, 180]].forEach(function (point, index) {
+      context.beginPath();
+      context.arc(point[0], point[1], 22, 0, Math.PI * 2);
+      context.fill();
+      context.beginPath();
+      context.moveTo(point[0] + 20, point[1]);
+      context.lineTo(point[0] + 20, point[1] - 80 - index * 6);
+      context.stroke();
+    });
+  } else if (theme.motif === "tech") {
+    for (let index = 0; index < 7; index += 1) {
+      const y = 260 + index * 130;
+      context.strokeRect(index % 2 ? 1125 : 22, y, 52, 52);
+      context.beginPath();
+      context.moveTo(index % 2 ? 1100 : 74, y + 26);
+      context.lineTo(index % 2 ? 1045 : 145, y + 26);
+      context.stroke();
+    }
+  } else if (theme.motif === "science") {
+    [[55, 350], [1140, 720], [65, 1040]].forEach(function (point) {
+      context.save();
+      context.translate(point[0], point[1]);
+      [0, Math.PI / 3, -Math.PI / 3].forEach(function (angle) {
+        context.rotate(angle);
+        context.beginPath();
+        context.ellipse(0, 0, 30, 75, 0, 0, Math.PI * 2);
+        context.stroke();
+        context.rotate(-angle);
+      });
+      context.beginPath();
+      context.arc(0, 0, 12, 0, Math.PI * 2);
+      context.fill();
+      context.restore();
+    });
+  } else if (theme.motif === "nature") {
+    [[35, 300, 0.6], [1120, 520, -0.7], [20, 950, 0.8], [1135, 1080, -0.5]].forEach(function (leaf) {
+      context.save();
+      context.translate(leaf[0], leaf[1]);
+      context.rotate(leaf[2]);
+      context.beginPath();
+      context.ellipse(0, 0, 28, 70, 0, 0, Math.PI * 2);
+      context.fill();
+      context.restore();
+    });
+  } else {
+    [[55, 300, 24], [1140, 480, 18], [45, 840, 20], [1130, 1040, 26]].forEach(function (star) {
+      context.beginPath();
+      for (let index = 0; index < 8; index += 1) {
+        const angle = -Math.PI / 2 + index * Math.PI / 4;
+        const radius = index % 2 === 0 ? star[2] * 2.1 : star[2] * 0.8;
+        const x = star[0] + Math.cos(angle) * radius;
+        const y = star[1] + Math.sin(angle) * radius;
+        if (index === 0) context.moveTo(x, y);
+        else context.lineTo(x, y);
+      }
+      context.closePath();
+      context.fill();
+    });
+  }
+  context.restore();
+}
+
+function fittedCanvasFont(context, text, maxWidth, maximum, minimum) {
+  let size = maximum;
+  while (size > minimum) {
+    context.font = "900 " + size + 'px "Hiragino Sans", "Yu Gothic", sans-serif';
+    if (context.measureText(text).width <= maxWidth) break;
+    size -= 2;
+  }
+  return size;
+}
+
+async function createLocalCareerCard(photoDataUrl, career, outfitImageUrl) {
+  const images = await Promise.all([
+    loadBrowserImage(photoDataUrl),
+    loadBrowserImage(outfitImageUrl),
+  ]);
+  const participantImage = images[0];
+  const outfitImage = images[1];
+  const compositorMode = careerCardCompositorMode();
+  let careerPortrait = outfitImage;
+  if (compositorMode === "smart") {
+    updateCareerImageLoadingText(
+      "かおを ふくに あわせているよ",
+      "しゃしんと がっせいは このPCの なかだけ",
+    );
+    const analysis = await analyzeParticipantPhoto(participantImage, "participant");
+    updateCareerImageLoadingText(
+      "しごとの ばめんに かおを あわせているよ",
+      "しゃしんと がっせいは このPCの なかだけ",
+    );
+    const targetAnalysis = await analyzeParticipantPhoto(outfitImage, "target");
+    careerPortrait = createSmartCareerPortrait(
+      participantImage,
+      outfitImage,
+      analysis,
+      targetAnalysis,
+    );
+  }
+  const reading = await localReading(career.name);
+  const theme = careerCardTheme(career.name);
+  const canvas = document.createElement("canvas");
+  canvas.width = 1200;
+  canvas.height = 1600;
+  const context = canvas.getContext("2d");
+
+  const background = context.createLinearGradient(0, 0, 1200, 1600);
+  background.addColorStop(0, theme.top);
+  background.addColorStop(1, theme.bottom);
+  context.fillStyle = background;
+  context.fillRect(0, 0, 1200, 1600);
+  drawCardMotifs(context, theme);
+
+  context.fillStyle = "rgba(255,255,255,0.94)";
+  roundedRectangle(context, 100, 62, 1000, 112, 56);
+  context.fill();
+  context.fillStyle = theme.ink;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.font = '900 46px "Hiragino Sans", "Yu Gothic", sans-serif';
+  context.fillText("AI ROBOT BOOK CAFE", 600, 118);
+
+  context.fillStyle = "#ffffff";
+  roundedRectangle(context, 82, 190, 1036, 1018, 48);
+  context.fill();
+  context.save();
+  roundedRectangle(context, 108, 216, 984, 966, 30);
+  context.clip();
+  drawImageCover(context, careerPortrait, 108, 216, 984, 966, 0.5);
+  context.restore();
+
+  if (compositorMode === "classic") {
+    context.save();
+    context.shadowColor = "rgba(23,50,77,0.35)";
+    context.shadowBlur = 22;
+    context.shadowOffsetY = 10;
+    context.fillStyle = "#ffffff";
+    context.beginPath();
+    context.ellipse(600, 484, 180, 208, 0, 0, Math.PI * 2);
+    context.fill();
+    context.restore();
+    context.save();
+    context.beginPath();
+    context.ellipse(600, 480, 165, 190, 0, 0, Math.PI * 2);
+    context.clip();
+    drawParticipantFaceClassic(context, participantImage, 435, 290, 330, 380);
+    context.restore();
+    context.strokeStyle = "rgba(255,255,255,0.98)";
+    context.lineWidth = 14;
+    context.beginPath();
+    context.ellipse(600, 480, 172, 198, 0, 0, Math.PI * 2);
+    context.stroke();
+  }
+
+  context.fillStyle = "rgba(255,255,255,0.96)";
+  roundedRectangle(context, 82, 1232, 1036, 296, 48);
+  context.fill();
+  context.fillStyle = theme.ink;
+  if (reading) {
+    const readingSize = fittedCanvasFont(context, reading, 900, 38, 24);
+    context.font = "800 " + readingSize + 'px "Hiragino Sans", "Yu Gothic", sans-serif';
+    context.fillText(reading, 600, 1280);
+  }
+
+  const name = String(career.name || "しごと");
+  const lines = name.length > 16
+    ? [name.slice(0, Math.ceil(name.length / 2)), name.slice(Math.ceil(name.length / 2))]
+    : [name];
+  const nameMaximum = lines.length === 1 ? 92 : 70;
+  const nameSize = Math.min.apply(null, lines.map(function (line) {
+    return fittedCanvasFont(context, line, 920, nameMaximum, 38);
+  }));
+  context.font = "900 " + nameSize + 'px "Hiragino Sans", "Yu Gothic", sans-serif';
+  if (lines.length === 1) {
+    context.fillText(lines[0], 600, 1390);
+  } else {
+    context.fillText(lines[0], 600, 1360);
+    context.fillText(lines[1], 600, 1440);
+  }
+
+  context.fillStyle = "#5c6d7d";
+  context.font = '800 30px "Hiragino Sans", "Yu Gothic", sans-serif';
+  context.fillText("みらいの おしごとカード", 600, 1490);
+  context.fillStyle = "rgba(255,255,255,0.92)";
+  context.font = '800 23px "Hiragino Sans", "Yu Gothic", sans-serif';
+  context.fillText("ばめんはAI・しゃしんと がっせいは このPCだけ", 600, 1565);
+  return canvas.toDataURL("image/png");
+}
+
+async function generateLocalCareerCard() {
+  careerImageLoadingScreen(state.career.selectedCareer.name, {
+    title: state.career.selectedCareer.name + "の ばめんを つくっているよ",
+    lead: "しゃしんは おくらず、しごとの ばめんだけ AIが つくるよ",
+  });
+  try {
+    const response = await apiPost("/api/career-card/outfit", {
+      careerId: state.career.selectedCareer.id,
+    });
+    const value = unwrapData(response) || {};
+    const outfitImageUrl = safeImageUrl(value.outfitUrl || value.resultUrl || "");
+    if (!outfitImageUrl || value.participantPhotoSent !== false) {
+      throw new ApiError("へんしん用の しゃしんが ありません", 502, response);
+    }
+    state.career.outfitImageUrl = outfitImageUrl;
+    const imageUrl = await createLocalCareerCard(
+      state.career.photoDataUrl,
+      state.career.selectedCareer,
+      outfitImageUrl,
+    );
+    stopCareerImageProgress();
+    state.career.resultImageUrl = imageUrl;
+    state.career.photoDataUrl = "";
+    renderCareerResult();
+  } catch (error) {
+    stopCareerImageProgress();
+    if (error instanceof LocalFaceCompositorError) {
+      const targetFailure = String(error.code || "").startsWith("TARGET_");
+      const localModelFailure = [
+        "MODEL_UNAVAILABLE",
+        "COMPOSITOR_TIMEOUT",
+        "COMPOSITOR_FAILED",
+      ].includes(error.code);
+      errorScreen({
+        title: targetFailure
+          ? "しごとの ばめんを つくりなおしてね"
+          : localModelFailure
+          ? "かおを あわせる じゅんびが できていません"
+          : error.message,
+        message: targetFailure || localModelFailure
+          ? "スタッフを よんでね"
+          : "ひとりで まえを むいて とりなおしてね",
+        retry: targetFailure || localModelFailure ? undefined : retakeCareerPhoto,
+        retryLabel: "しゃしんを とりなおす",
+        back: renderCareerPhotoReview,
+        backLabel: "しゃしんを かくにん",
+      });
+      return;
+    }
+    errorScreen({
+      title: "しごとの ばめんを つくれなかったよ",
+      message: formatChildError(error),
+      retry: generateLocalCareerCard,
+      retryLabel: "もういちど つくる",
+      back: renderCareerPhotoReview,
+      backLabel: "しゃしんを かくにん",
+    });
+  }
+}
+
 function renderCareerResult() {
+  const localCard = isLocalCareerCard();
   setView(
     '<section class="screen print-area"><div class="result-layout">' +
       '<div class="result-image-frame result-image-frame--portrait">' +
@@ -1103,25 +2115,36 @@ function renderCareerResult() {
       escapeHtml(state.career.resultImageUrl) +
       '" alt="' +
       escapeHtml(state.career.selectedCareer.name) +
-      'に なりきった しゃしん" /><p class="career-print-label">AIでつくった未来のわたし：' +
+      (localCard ? 'の おしごとカード' : 'に なりきった しゃしん') +
+      '" /><p class="career-print-label">' +
+      (localCard ? "場面はAI生成・本人写真はこのPC内だけで合成：" : "AIでつくった未来のわたし：") +
       escapeHtml(state.career.selectedCareer.name) +
       '</p></div>' +
       '<div class="result-copy no-print"><p class="eyebrow">できあがり！</p>' +
       '<h1><span class="career-result-job">' +
       escapeHtml(state.career.selectedCareer.name) +
-      '</span><span class="career-result-suffix">に へんしん！</span></h1>' +
-      '<p class="lead">スタッフを よんでね</p>' +
+      '</span><span class="career-result-suffix">' +
+      (localCard ? "の カード！" : "に へんしん！") +
+      "</span></h1>" +
+      '<p class="lead">' +
+      (localCard ? "ばめんは AI・しゃしんと がっせいは このPCだけ" : "スタッフを よんでね") +
+      "</p>" +
       '<div class="actions">' +
       '<button class="button" id="print-career" type="button">スタッフが いんさつ</button>' +
+      (localCard
+        ? '<button class="button button--secondary" id="retake-career-card" type="button">しゃしんを とりなおす</button>'
+        : "") +
       '<button class="button button--secondary" id="career-again" type="button">つぎの人に かわる</button>' +
       "</div></div></div></section>",
   );
   document.querySelector("#print-career").addEventListener("click", function () {
     window.print();
   });
+  const retakeCard = document.querySelector("#retake-career-card");
+  if (retakeCard) retakeCard.addEventListener("click", retakeCareerPhoto);
   document.querySelector("#career-again").addEventListener("click", function () {
     if (window.confirm("写真の紙が出たことをスタッフが確認しましたか？ 次へ進むとこの画面には戻れません。")) {
-      initCareer();
+      restartCareerFlow();
     }
   });
 }
@@ -2867,6 +3890,7 @@ function startCurrentRoute() {
 
   if (route.key === "home") renderHome();
   else if (route.key === "career") initCareer();
+  else if (route.key === "career-card") initCareerCard();
   else if (route.key === "craft") initCraft();
   else if (route.key === "dream") initDream();
   else if (route.key === "memory") initMemory();
@@ -2926,7 +3950,10 @@ restartButton.addEventListener("click", function () {
 });
 
 window.addEventListener("popstate", boot);
-window.addEventListener("beforeunload", clearTransientState);
+window.addEventListener("beforeunload", function () {
+  clearTransientState();
+  disposeLocalFaceWorker("COMPOSITOR_FAILED");
+});
 window.addEventListener("offline", function () {
   showToast("ネットワークに つながっていません", 5000);
 });

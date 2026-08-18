@@ -9,6 +9,14 @@ const screenshotDir = path.join(projectDir, 'docs', 'screenshots');
 const publicBase = (process.env.PUBLIC_BASE_URL || 'http://127.0.0.1:4410').replace(/\/$/, '');
 const hostBase = (process.env.HOST_BASE_URL || 'http://127.0.0.1:4411').replace(/\/$/, '');
 const errors = [];
+// 実在人物の写真を使わず、ImageGenで作成した眼鏡ありの架空成人画像で
+// Face Landmarkerと顔メッシュ合成を含む実画像相当の経路を確認する。
+const localCardPortrait = await fs.readFile(path.join(
+  projectDir,
+  'test',
+  'fixtures',
+  'fictional-adult-glasses-portrait.png',
+));
 
 await fs.mkdir(screenshotDir, { recursive: true });
 
@@ -26,7 +34,11 @@ async function jsonRequest(base, pathname, body = undefined) {
 function watch(page, name) {
   page.on('pageerror', (error) => errors.push(`${name}: ${error.message}`));
   page.on('console', (message) => {
-    if (message.type() === 'error') errors.push(`${name}: ${message.text()}`);
+    const value = message.text();
+    // MediaPipe内部のINFOがChromeではconsole.errorとして届く既知の表示だけ除外する。
+    if (message.type() === 'error' && !value.startsWith('INFO: Created TensorFlow Lite XNNPACK delegate')) {
+      errors.push(`${name}: ${value}`);
+    }
   });
 }
 
@@ -119,6 +131,124 @@ try {
     throw new Error('印刷時のAI生成表示が見つかりません。');
   }
   await career.emulateMedia({ media: 'screen' });
+
+  const careerCard = await context.newPage();
+  watch(careerCard, 'career-card-flow');
+  let careerCardGenerateRequests = 0;
+  let careerCardOutfitRequests = 0;
+  let careerCardOutfitPayload;
+  let careerCardPhotoRequest = false;
+  const careerCardExternalRequests = [];
+  careerCard.on('request', (request) => {
+    const requestUrl = new URL(request.url());
+    if (/^https?:$/.test(requestUrl.protocol) && requestUrl.origin !== new URL(publicBase).origin) {
+      careerCardExternalRequests.push(requestUrl.origin);
+    }
+    if (request.method() !== 'POST') return;
+    if (request.url().endsWith('/api/career/generate')) careerCardGenerateRequests += 1;
+    if (request.url().endsWith('/api/career-card/outfit')) {
+      careerCardOutfitRequests += 1;
+      careerCardOutfitPayload = request.postDataJSON();
+    }
+    if ((request.postData() || '').includes('data:image/')) careerCardPhotoRequest = true;
+  });
+  await careerCard.route('**/api/health', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      textAi: { ok: true },
+      image: { ready: false },
+      careerCardOutfit: { ready: true, sendsParticipantPhoto: false },
+      careerCardCompositor: { mode: 'smart', ready: true, localOnly: true, sendsParticipantPhoto: false },
+    }),
+  }));
+  await careerCard.goto(`${publicBase}/career-card`);
+  for (let index = 0; index < 4; index += 1) await clickFirstAnswer(careerCard);
+  await careerCard.locator('[data-career-index]').first().click();
+  const careerCardFile = careerCard.locator('#career-photo-file');
+  await careerCardFile.waitFor({ state: 'attached', timeout: 10_000 });
+  await careerCardFile.setInputFiles({
+    name: 'local-card.png',
+    mimeType: 'image/png',
+    buffer: localCardPortrait,
+  });
+  await careerCard.locator('#generate-career').waitFor({ state: 'visible', timeout: 10_000 });
+  await careerCard.locator('#generate-career').click();
+  await careerCard.locator('#print-career').waitFor({ state: 'visible', timeout: 10_000 });
+  await assertFurigana(careerCard, 'career-card-result');
+  if (careerCardGenerateRequests !== 0 || careerCardPhotoRequest) {
+    throw new Error('career-card-flow: 写真をAPIへ送信しました。');
+  }
+  if (careerCardExternalRequests.length) {
+    throw new Error(`career-card-flow: ローカル合成ファイルを外部から取得しました: ${careerCardExternalRequests.join(', ')}`);
+  }
+  if (careerCardOutfitRequests !== 1) {
+    throw new Error(`career-card-flow: 服装生成APIが${careerCardOutfitRequests}回呼ばれました。`);
+  }
+  if (!careerCardOutfitPayload?.careerId || Object.keys(careerCardOutfitPayload).join('|') !== 'careerId') {
+    throw new Error(`career-card-flow: 服装生成APIへ不要なデータを送りました: ${JSON.stringify(careerCardOutfitPayload)}`);
+  }
+  const careerCardImage = await careerCard.locator('.result-image').evaluate((element) => new Promise((resolve) => {
+    const image = element;
+    const done = () => resolve({
+      src: image.getAttribute('src') || '',
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+    });
+    if (image.complete) done();
+    else image.addEventListener('load', done, { once: true });
+  }));
+  if (!careerCardImage.src.startsWith('data:image/png;base64,')) {
+    throw new Error('career-card-flow: 完成カードがブラウザ内PNGではありません。');
+  }
+  if (careerCardImage.width !== 1200 || careerCardImage.height !== 1600) {
+    throw new Error(`career-card-flow: 完成カードが${careerCardImage.width}x${careerCardImage.height}です。`);
+  }
+  if (!/ばめんは AI・しゃしんと がっせいは このPCだけ/.test(await careerCard.locator('.result-copy').innerText())) {
+    throw new Error('career-card-flow: 写真を送信しない案内がありません。');
+  }
+  await careerCard.screenshot({ path: path.join(screenshotDir, 'flow-career-card-result-1366x768.png'), fullPage: true });
+  await careerCard.setViewportSize({ width: 390, height: 844 });
+  const careerCardMobileLayout = await careerCard.evaluate(() => ({
+    width: document.documentElement.clientWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+  }));
+  if (careerCardMobileLayout.scrollWidth > careerCardMobileLayout.width + 1) {
+    throw new Error(`career-card-flow: モバイルで横スクロール ${careerCardMobileLayout.scrollWidth}px > ${careerCardMobileLayout.width}px`);
+  }
+  await careerCard.screenshot({ path: path.join(screenshotDir, 'flow-career-card-result-390x844.png'), fullPage: true });
+  await careerCard.setViewportSize({ width: 1366, height: 768 });
+  await careerCard.emulateMedia({ media: 'print' });
+  if (!(await careerCard.locator('.career-print-label').isVisible())) {
+    throw new Error('career-card-flow: 印刷時のおしごとカード表示が見つかりません。');
+  }
+  if (!/本人写真はこのPC内だけ/.test(await careerCard.locator('.career-print-label').innerText())) {
+    throw new Error('career-card-flow: 印刷物にローカル作成表示がありません。');
+  }
+  await careerCard.emulateMedia({ media: 'screen' });
+
+  // 顔がない写真では外部送信や従来合成へ切り替えず、撮り直しで停止する。
+  await careerCard.locator('#retake-career-card').click();
+  const noFaceFile = careerCard.locator('#career-photo-file');
+  await noFaceFile.waitFor({ state: 'attached', timeout: 10_000 });
+  await noFaceFile.setInputFiles({
+    name: 'no-face.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEklEQVQImWPILjqZXXSSAUIBACy+BpkBZOd5AAAAAElFTkSuQmCC', 'base64'),
+  });
+  await careerCard.locator('#generate-career').click();
+  await careerCard.getByRole('heading', { name: 'かおを みつけられなかったよ' })
+    .waitFor({ state: 'visible', timeout: 10_000 });
+  await careerCard.getByRole('button', { name: 'しゃしんを とりなおす' })
+    .waitFor({ state: 'visible', timeout: 2_000 });
+  await assertFurigana(careerCard, 'career-card-no-face');
+  if (careerCardGenerateRequests !== 0 || careerCardPhotoRequest) {
+    throw new Error('career-card-no-face: 失敗時に写真をAPIへ送信しました。');
+  }
+  if (careerCardOutfitRequests !== 2) {
+    throw new Error(`career-card-no-face: 服装生成APIが合計${careerCardOutfitRequests}回呼ばれました。`);
+  }
+  await careerCard.screenshot({ path: path.join(screenshotDir, 'flow-career-card-no-face-1366x768.png'), fullPage: true });
 
   const craft = await context.newPage();
   watch(craft, 'craft-flow');
@@ -220,6 +350,6 @@ if (errors.length) {
   console.error(errors.join('\n'));
   process.exitCode = 1;
 } else {
-  console.log('実バックエンド結合UIフロー: ①②③④とホスト公開まで成功');
+  console.log('実バックエンド結合UIフロー: ①②③④⑤とホスト公開まで成功');
   console.log(`結果スクリーンショット: ${screenshotDir}`);
 }

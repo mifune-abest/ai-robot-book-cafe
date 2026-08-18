@@ -5,4 +5,5 @@ certs/
 test-results/
 playwright-report/
 docs/screenshots/*.png
+public/models/selfie_multiclass_256x256.tflite
 *.log

@@ -13,6 +13,11 @@ import { cleanOptionalText, cleanText, integer, oneOf, parseDataUrl, randomId } 
 import { CRAFT_MATERIAL_LIMIT, ImageService } from './services/image-service.js';
 import { CodexAppServerService } from './services/codex-app-server.js';
 import { FuriganaService } from './services/furigana-service.js';
+import {
+  CAREER_CARD_FACE_SLOT,
+  localCompositorAssetsStatus,
+  mediaPipePackageDir,
+} from './services/local-compositor-assets.js';
 import { createMemoryPoster } from './services/memory-poster.js';
 import { JsonStore } from './store.js';
 
@@ -39,6 +44,7 @@ function sessionCleanup() {
     if (value.createdAt < cutoff) {
       careerSessions.delete(id);
       store.deleteMediaUrl(value.resultUrl).catch(() => undefined);
+      store.deleteMediaUrl(value.cardOutfitUrl).catch(() => undefined);
     }
   }
   for (const [id, value] of careerInterviewSessions) {
@@ -77,7 +83,7 @@ function securityHeaders(req, res, next) {
   res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
   res.setHeader('Cache-Control', 'no-store, max-age=0');
   res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
   next();
 }
 
@@ -149,6 +155,7 @@ function publicConfig() {
     materials: state.materials.filter((item) => item.active).map(({ id, name, url }) => ({ id, name, url })),
     imageMode: images.status().mode,
     audienceMode: images.status().adultTestMode ? 'adult-test' : 'standard',
+    careerCardCompositor: config.careerCardCompositor,
   };
 }
 
@@ -201,6 +208,8 @@ function createPublicApp() {
   app.get('/api/health', asyncRoute(async (req, res) => {
     const textHealth = await textAi.health();
     const imageHealth = images.status();
+    const careerCardOutfitHealth = images.careerCardOutfitStatus();
+    const compositorHealth = localCompositorAssetsStatus(config.careerCardCompositor);
     res.json({
       textAi: config.testMode ? textHealth : { ok: textHealth.ok, ...(textHealth.ok ? { model: textHealth.model } : { reason: textHealth.reason }) },
       image: {
@@ -210,6 +219,15 @@ function createPublicApp() {
         ...(imageHealth.model ? { model: imageHealth.model } : {}),
         ...(imageHealth.adultTestMode ? { audience: 'adult-test' } : {}),
       },
+      careerCardOutfit: {
+        mode: careerCardOutfitHealth.mode,
+        ready: careerCardOutfitHealth.ready
+          && (careerCardOutfitHealth.mode !== 'codex' || textHealth.imageGeneration === true),
+        external: careerCardOutfitHealth.external,
+        sendsParticipantPhoto: false,
+        ...(careerCardOutfitHealth.model ? { model: careerCardOutfitHealth.model } : {}),
+      },
+      careerCardCompositor: compositorHealth,
       queues: { text: textQueue.status(), image: imageQueue.status() },
     });
   }));
@@ -324,6 +342,8 @@ function createPublicApp() {
           createdAt: Date.now(),
           status: 'ready',
           resultUrl: null,
+          cardOutfitStatus: 'ready',
+          cardOutfitUrl: null,
         });
         return {
           careerId,
@@ -368,6 +388,52 @@ function createPublicApp() {
       res.json({ resultUrl, job: session.job, mock: images.status().mode === 'mock' });
     } catch (error) {
       session.status = 'ready';
+      throw error;
+    }
+  }));
+
+  app.post('/api/career-card/outfit', asyncRoute(async (req, res) => {
+    const unexpectedFields = Object.keys(req.body || {}).filter((key) => key !== 'careerId');
+    if (unexpectedFields.length) {
+      throw new AppError('PHOTO_NOT_ACCEPTED', '⑤では職業ID以外をサーバーへ送りません。', 400);
+    }
+    const careerId = cleanText(req.body?.careerId, { field: 'しごと', max: 60 });
+    const session = careerSessions.get(careerId);
+    if (!session) throw new AppError('SESSION_EXPIRED', 'さいしょから ためしてください。', 410);
+    if (session.cardOutfitStatus === 'done') {
+      return res.json({
+        outfitUrl: session.cardOutfitUrl,
+        job: session.job,
+        mock: images.careerCardOutfitStatus().mode === 'mock',
+        participantPhotoSent: false,
+        faceSlot: CAREER_CARD_FACE_SLOT,
+      });
+    }
+    if (session.cardOutfitStatus === 'generating') {
+      throw new AppError('ALREADY_GENERATING', 'いま へんしん用の服をつくっています。', 409);
+    }
+    session.cardOutfitStatus = 'generating';
+    session.createdAt = Date.now();
+    try {
+      const buffer = await imageQueue.run(() => images.careerCardOutfit({
+        job: session.job,
+        visualMotif: session.visualMotif,
+      }));
+      const outfitUrl = await store.saveMedia(randomId('career_card_outfit_'), buffer, 'png');
+      Object.assign(session, {
+        cardOutfitStatus: 'done',
+        cardOutfitUrl: outfitUrl,
+        createdAt: Date.now(),
+      });
+      return res.json({
+        outfitUrl,
+        job: session.job,
+        mock: images.careerCardOutfitStatus().mode === 'mock',
+        participantPhotoSent: false,
+        faceSlot: CAREER_CARD_FACE_SLOT,
+      });
+    } catch (error) {
+      session.cardOutfitStatus = 'ready';
       throw error;
     }
   }));
@@ -535,9 +601,10 @@ function createPublicApp() {
   });
   app.use('/media', express.static(store.mediaDir, { index: false, fallthrough: false, cacheControl: false, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
   app.use('/materials', express.static(store.materialDir, { index: false, fallthrough: false, cacheControl: false, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
+  app.use('/vendor/mediapipe', express.static(mediaPipePackageDir, { index: false, fallthrough: false, etag: true, maxAge: '1y', immutable: true }));
   app.use(express.static(publicDir, { index: false, etag: false, cacheControl: false }));
   app.get('/', (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
-  app.get(['/career', '/craft', '/dream', '/memory'], (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
+  app.get(['/career', '/career-card', '/craft', '/dream', '/memory'], (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
   app.all(['/host', '/api/host', '/api/host/*splat'], (req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'このページはありません。' } }));
   app.use((req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'このページはありません。' } }));
   app.use(errorHandler);
@@ -796,6 +863,18 @@ async function start() {
   if (imageHealth.mode === 'codex' && imageHealth.adultTestMode !== true) {
     throw new Error('Codex画像生成は成人テスト専用です。ADULT_TEST_MODE=trueがない状態では起動しません。');
   }
+  const careerCardOutfitHealth = images.careerCardOutfitStatus();
+  if (!careerCardOutfitHealth.ready) {
+    throw new Error(`⑤の職業場面生成設定を利用できません (${careerCardOutfitHealth.mode})。自動的に別の送信先へは切り替えません。`);
+  }
+  if (careerCardOutfitHealth.mode === 'codex' && health.imageGeneration !== true) {
+    throw new Error('⑤でCodex app-serverの画像生成機能を利用できません。別の送信先へは切り替えません。');
+  }
+  const compositorHealth = localCompositorAssetsStatus(config.careerCardCompositor);
+  if (!compositorHealth.ready) {
+    const details = [...(compositorHealth.missing || []), ...(compositorHealth.changed || [])].join(', ');
+    throw new Error(`⑤のローカル顔合成を利用できません (${compositorHealth.mode}${details ? `: ${details}` : ''})。固定楕円や外部AIへは自動的に切り替えません。`);
+  }
 
   const publicApp = createPublicApp();
   const hostApp = createHostApp();
@@ -837,6 +916,8 @@ async function start() {
   console.log(`ホスト専用: http://127.0.0.1:${config.hostPort}/host`);
   console.log(`同時処理: 画像 ${config.imageConcurrency}件 / 会話AI ${config.textConcurrency}件`);
   console.log(`Codex app-server: ${health.ok ? `準備OK (${health.model})` : `利用不可 (${health.reason})`}`);
+  console.log(`⑤の職業場面生成: ${careerCardOutfitHealth.mode === 'codex' ? 'Codex app-server / gpt-image-2' : 'おためしモード'}`);
+  console.log(`⑤の顔合成: ${compositorHealth.mode === 'smart' ? 'PC内MediaPipe（写真送信なし）' : '従来の固定楕円（手動設定）'}`);
   if (protocol === 'http') console.log('注意: LANのHTTP接続ではブラウザのカメラを利用できません。HTTPS設定が必要です。');
 
   let shuttingDown = false;
